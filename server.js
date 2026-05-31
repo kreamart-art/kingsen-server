@@ -19,7 +19,10 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createServer } from "node:http";
+import { WebSocketServer } from "ws";
 import { openDatabase } from "./db.js";
+import { roomEngine } from "./rooms.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -213,8 +216,66 @@ app.post("/sets/:id/report", writeLimiter, (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/ws-health", (_req, res) => res.json({ ok: true, ...roomEngine.stats() }));
+
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(PORT, () => {
-  console.log(`Kingsen server on :${PORT}  (engine: ${engine}, db: ${DB_PATH})`);
+/* ---- WebSocket multiplayer on /ws ---- */
+const httpServer = createServer(app);
+const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+
+function send(ws, msg) { try { ws.send(JSON.stringify(msg)); } catch { /* closed */ } }
+function broadcast(room) {
+  const state = roomEngine.publicState(room);
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client._code === room.code) {
+      send(client, { t: "state", state });
+    }
+  }
+}
+
+wss.on("connection", (ws) => {
+  ws._code = null;
+  ws._pid = null;
+  ws.on("message", (buf) => {
+    let m;
+    try { m = JSON.parse(String(buf)); } catch { return; }
+    if (!m || typeof m.t !== "string") return;
+
+    if (m.t === "create") {
+      const room = roomEngine.create({
+        hostId: m.playerId, name: m.name, setCode: m.setCode,
+        setName: m.setName, lang: m.lang, alcoholFree: m.alcoholFree,
+      });
+      ws._code = room.code; ws._pid = m.playerId;
+      send(ws, { t: "joined", code: room.code, playerId: m.playerId, hostId: room.hostId });
+      broadcast(room);
+      return;
+    }
+    if (m.t === "join") {
+      const r = roomEngine.join({ code: m.code, playerId: m.playerId, name: m.name });
+      if (r.error) { send(ws, { t: "error", error: r.error }); return; }
+      ws._code = r.room.code; ws._pid = m.playerId;
+      send(ws, { t: "joined", code: r.room.code, playerId: m.playerId, hostId: r.room.hostId });
+      broadcast(r.room);
+      return;
+    }
+    if (m.t === "action") {
+      const r = roomEngine.action(ws._code, ws._pid, m.action, m.payload);
+      if (r.error) { send(ws, { t: "error", error: r.error }); return; }
+      if (r.room) broadcast(r.room);
+      return;
+    }
+    if (m.t === "ping") { send(ws, { t: "pong" }); return; }
+  });
+  ws.on("close", () => {
+    if (ws._code && ws._pid) {
+      const room = roomEngine.disconnect(ws._code, ws._pid);
+      if (room) broadcast(room);
+    }
+  });
+});
+
+httpServer.listen(PORT, () => {
+  console.log(`Kingsen server on :${PORT}  (engine: ${engine}, db: ${DB_PATH}, ws: /ws)`);
 });

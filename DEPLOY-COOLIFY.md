@@ -8,6 +8,12 @@ handles HTTPS, the subdomain, restarts and logs. Your existing apps are untouche
 - **Chosen domain:** `https://kingsen-api.artnomad.nl`  (artnomad.nl has wildcard DNS → already resolves to the server, no DNS change needed)
 - **Internal port:** `8787`
 
+> **Multiplayer (WebSocket):** the same server also serves the realtime game on
+> `wss://kingsen-api.artnomad.nl/ws`. It shares the HTTP port (8787) — no extra
+> Coolify config needed. Traefik forwards WebSocket upgrades automatically, so a
+> normal redeploy of this resource enables online play. The app derives the WS URL
+> from its `VITE_KINGSEN_API` automatically.
+
 ## Steps in the Coolify UI
 
 1. **Open Coolify** → `http://178.105.193.198:8000` (or your Coolify domain) and log in.
