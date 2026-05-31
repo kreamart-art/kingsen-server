@@ -276,6 +276,15 @@ wss.on("connection", (ws) => {
   });
 });
 
+// Host-grace watchdog: when a host's 10s grace expires, the room closes and we
+// push the closed state to everyone still connected so they're notified.
+setInterval(() => {
+  try {
+    const changed = roomEngine.tick();
+    for (const room of changed) broadcast(room);
+  } catch { /* ignore */ }
+}, 1000).unref?.();
+
 httpServer.listen(PORT, () => {
   console.log(`Kingsen server on :${PORT}  (engine: ${engine}, db: ${DB_PATH}, ws: /ws)`);
 });

@@ -81,6 +81,9 @@ function newRoom(code, hostId, opts) {
     houseRules: [],
     pendingBuddy: false,
     loser: null,
+    timer: null,                       // {duration, endsAt} when running, else null
+    hostAwaySince: 0,                  // ms timestamp when host disconnected (0 = present)
+    closed: false,                     // host left and grace expired
     createdAt: Date.now(),
     touchedAt: Date.now(),
   };
@@ -107,9 +110,14 @@ function publicState(room) {
     houseRules: room.houseRules,
     pendingBuddy: room.pendingBuddy,
     loser: room.loser,
+    timer: room.timer,                 // {duration, endsAt(ms)} or null
+    hostAwaySince: room.hostAwaySince || 0,
+    closed: !!room.closed,
     gameOver: room.kings >= 4 && room.card && room.effects[room.card.rank] === "king",
   };
 }
+
+const HOST_GRACE_MS = 10000; // host can rejoin within 10s before the room closes
 
 function currentPlayer(room) { return room.players[room.turn]; }
 
@@ -127,13 +135,17 @@ export const roomEngine = {
   join({ code, playerId, name }) {
     const room = rooms.get((code || "").toUpperCase());
     if (!room) return { error: "Room niet gevonden" };
+    if (room.closed) return { error: "Room gesloten" };
     let p = room.players.find((x) => x.id === playerId);
     if (p) { p.connected = true; p.name = cleanName(name) || p.name; } // reconnect
     else {
+      // a started game still allows REJOIN of a known player (handled above);
+      // brand-new players can't join mid-game.
       if (room.started) return { error: "Spel al begonnen" };
       if (room.players.length >= 12) return { error: "Room vol" };
       room.players.push({ id: playerId, name: cleanName(name), connected: true, cards: 0, threes: 0 });
     }
+    if (playerId === room.hostId) room.hostAwaySince = 0; // host is back -> cancel grace
     room.touchedAt = Date.now();
     return { room };
   },
@@ -174,6 +186,14 @@ export const roomEngine = {
           if (room.kings >= 4) room.loser = cur.name;
         }
         room.card = next; room.flipped = true;
+        room.timer = null; // fresh card -> no timer yet
+        return { room };
+      }
+      case "timer": {
+        if (!isTurn) return { error: "Niet jouw beurt" };
+        const dur = Math.max(5, Math.min(120, Number(payload && payload.duration) || 0));
+        if (!dur) { room.timer = null; return { room }; }
+        room.timer = { duration: dur, endsAt: Date.now() + dur * 1000 };
         return { room };
       }
       case "buddy": {
@@ -192,7 +212,18 @@ export const roomEngine = {
         if (!isTurn) return { error: "Niet jouw beurt" };
         if (room.pendingBuddy) return { error: "Kies eerst een drinkmaatje" };
         room.flipped = false; room.card = null;
+        room.timer = null;
         room.turn = (room.turn + 1) % room.players.length;
+        return { room };
+      }
+      case "leave": {
+        // Explicit leave = mark offline but KEEP the player so they can rejoin
+        // to finish the game (fail-safe). Host leaving starts the grace window.
+        const p = room.players.find((x) => x.id === playerId);
+        if (p) p.connected = false;
+        if (playerId === room.hostId && room.started && !room.closed) {
+          room.hostAwaySince = Date.now();
+        }
         return { room };
       }
       case "restart": {
@@ -214,16 +245,37 @@ export const roomEngine = {
     if (!room) return null;
     const p = room.players.find((x) => x.id === playerId);
     if (p) p.connected = false;
-    // if everyone is gone, leave it for the reaper
+    // If the host drops while a game is in progress, start the 10s grace clock.
+    if (playerId === room.hostId && room.started && !room.closed && !room.hostAwaySince) {
+      room.hostAwaySince = Date.now();
+    }
     room.touchedAt = Date.now();
     return room;
+  },
+
+  // Returns the list of rooms whose state changed this tick (host-grace expiry),
+  // so the WS layer can broadcast the "closed" state to remaining players.
+  tick() {
+    const now = Date.now();
+    const changed = [];
+    for (const [, room] of rooms) {
+      if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= HOST_GRACE_MS) {
+        room.closed = true;
+        room.hostAwaySince = 0;
+        changed.push(room);
+      }
+    }
+    return changed;
   },
 
   reap() {
     const now = Date.now();
     for (const [code, room] of rooms) {
       const anyConnected = room.players.some((p) => p.connected);
-      if (!anyConnected && now - room.touchedAt > ROOM_TTL_MS) rooms.delete(code);
+      const old = now - room.touchedAt > ROOM_TTL_MS;
+      // closed rooms linger briefly so clients can receive the closed state.
+      const closedStale = room.closed && now - room.touchedAt > 30000;
+      if ((!anyConnected && old) || closedStale) rooms.delete(code);
     }
   },
 
