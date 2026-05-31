@@ -1,0 +1,26 @@
+[Unit]
+Description=Kingsen community-sets API
+After=network.target
+
+[Service]
+Type=simple
+# Run as a non-root user you created (see README step 2).
+User=kingsen
+Group=kingsen
+WorkingDirectory=/opt/kingsen
+ExecStart=/usr/bin/node /opt/kingsen/server.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=8787
+Environment=KINGSEN_DB=/opt/kingsen/kingsen.db
+# Set your real domain(s):
+Environment=KINGSEN_ORIGINS=https://kingsen.app,https://www.kingsen.app
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/kingsen
+
+[Install]
+WantedBy=multi-user.target
