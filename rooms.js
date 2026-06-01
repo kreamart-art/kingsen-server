@@ -85,6 +85,7 @@ function newRoom(code, hostId, opts) {
     loser: null,
     timer: null,                       // {duration, endsAt} when running, else null
     hostAwaySince: 0,                  // ms timestamp when host disconnected (0 = present)
+    lastLeft: null,                    // {name, at} of the most recent guest who left
     closed: false,                     // host left and grace expired
     createdAt: Date.now(),
     touchedAt: Date.now(),
@@ -118,6 +119,7 @@ function publicState(room) {
     loser: room.loser,
     timer: room.timer,                 // {duration, endsAt(ms)} or null
     hostAwaySince: room.hostAwaySince || 0,
+    lastLeft: room.lastLeft || null,
     closed: !!room.closed,
     gameOver: room.kings >= 4 && room.card && room.effects[room.card.rank] === "king",
   };
@@ -126,6 +128,34 @@ function publicState(room) {
 const HOST_GRACE_MS = 10000; // host can rejoin within 10s before the room closes
 
 function currentPlayer(room) { return room.players[room.turn]; }
+
+// Remove a player and keep room.turn valid. If the leaver was the active
+// player (mid-card), clear the card so the next player gets a clean turn.
+function removePlayerAt(room, idx) {
+  if (idx < 0) return;
+  const wasActive = idx === room.turn;
+  room.players.splice(idx, 1);
+  if (room.players.length === 0) { room.turn = 0; return; }
+  if (idx < room.turn) room.turn -= 1;           // shift pointer for earlier removals
+  if (room.turn >= room.players.length) room.turn = 0; // clamp (wrap if last left)
+  if (wasActive) {                               // their turn ended with them
+    room.flipped = false; room.card = null; room.timer = null;
+    room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
+  }
+}
+
+// Advance to the next turn, skipping players who are currently disconnected
+// (so the game never stalls on someone who closed their tab). Falls back to
+// the next index if everyone else is offline.
+function advanceTurn(room) {
+  const n = room.players.length;
+  if (n === 0) { room.turn = 0; return; }
+  for (let step = 1; step <= n; step++) {
+    const idx = (room.turn + step) % n;
+    if (room.players[idx] && room.players[idx].connected) { room.turn = idx; return; }
+  }
+  room.turn = (room.turn + 1) % n; // everyone else offline -> just move on
+}
 
 /* ---- the registry / engine API used by the WS layer ---- */
 export const roomEngine = {
@@ -230,16 +260,33 @@ export const roomEngine = {
         if (room.pendingRule) return { error: "Verzin eerst een regel" };
         room.flipped = false; room.card = null;
         room.timer = null;
-        room.turn = (room.turn + 1) % room.players.length;
+        advanceTurn(room);
+        return { room };
+      }
+      case "skip": {
+        // host can force the turn forward when the active player is gone/offline
+        // (e.g. a guest disconnected on their turn) so the game never freezes.
+        if (!isHost) return { error: "Alleen de host kan overslaan" };
+        room.flipped = false; room.card = null; room.timer = null;
+        room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
+        advanceTurn(room);
         return { room };
       }
       case "leave": {
-        // Explicit leave = mark offline but KEEP the player so they can rejoin
-        // to finish the game (fail-safe). Host leaving starts the grace window.
         const p = room.players.find((x) => x.id === playerId);
-        if (p) p.connected = false;
-        if (playerId === room.hostId && room.started && !room.closed) {
-          room.hostAwaySince = Date.now();
+        if (playerId === room.hostId) {
+          // Host leaving = pause the room; 10s grace, then tick() closes it and
+          // everyone is kicked. Keep the host in the list so they can rejoin.
+          if (p) p.connected = false;
+          if (room.started && !room.closed) room.hostAwaySince = Date.now();
+        } else {
+          // A guest (invited player) leaving does NOT affect the room: remove
+          // them entirely and fix the turn pointer so play continues.
+          if (p) {
+            room.lastLeft = { name: p.name, at: Date.now() };
+            const idx = room.players.findIndex((x) => x.id === playerId);
+            removePlayerAt(room, idx);
+          }
         }
         return { room };
       }
