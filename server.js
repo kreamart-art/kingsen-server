@@ -245,7 +245,7 @@ wss.on("connection", (ws) => {
     if (m.t === "create") {
       const room = roomEngine.create({
         hostId: m.playerId, name: m.name, setCode: m.setCode,
-        setName: m.setName, lang: m.lang, alcoholFree: m.alcoholFree,
+        setName: m.setName, lang: m.lang, alcoholFree: m.alcoholFree, avatar: m.avatar,
       });
       ws._code = room.code; ws._pid = m.playerId;
       send(ws, { t: "joined", code: room.code, playerId: m.playerId, hostId: room.hostId });
@@ -253,7 +253,7 @@ wss.on("connection", (ws) => {
       return;
     }
     if (m.t === "join") {
-      const r = roomEngine.join({ code: m.code, playerId: m.playerId, name: m.name });
+      const r = roomEngine.join({ code: m.code, playerId: m.playerId, name: m.name, avatar: m.avatar });
       if (r.error) { send(ws, { t: "error", error: r.error }); return; }
       ws._code = r.room.code; ws._pid = m.playerId;
       send(ws, { t: "joined", code: r.room.code, playerId: m.playerId, hostId: r.room.hostId });
