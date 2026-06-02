@@ -121,7 +121,11 @@ function publicState(room) {
     hostAwaySince: room.hostAwaySince || 0,
     lastLeft: room.lastLeft || null,
     closed: !!room.closed,
-    gameOver: room.kings >= 4 && room.card && room.effects[room.card.rank] === "king",
+    // Sticky: once the 4th king is drawn the game is over and STAYS over until a
+    // restart (which resets kings to 0). loser is already persisted, so a client
+    // that was mid-reconnect when the king landed still sees the end on rejoin —
+    // instead of the old transient flag that was only true while the card showed.
+    gameOver: room.kings >= 4,
   };
 }
 
