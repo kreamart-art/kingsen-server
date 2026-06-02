@@ -82,6 +82,8 @@ function newRoom(code, hostId, opts) {
     pendingBuddy: false,
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
+    turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
+    lastTimeout: null,                  // {name, at} of the most recent auto-skipped (too-slow) player
     loser: null,
     timer: null,                       // {duration, endsAt} when running, else null
     hostAwaySince: 0,                  // ms timestamp when host disconnected (0 = present)
@@ -93,6 +95,13 @@ function newRoom(code, hostId, opts) {
 }
 
 const RULE_MS = 60000; // 60s to invent a mandatory house rule
+// Auto-skip a stalled turn: the active player gets a 15s grace, then a 30s
+// visible countdown; if they STILL haven't drawn, their turn is passed on and
+// they must take a sip/shot. Server-authoritative so it fires even if their app
+// is backgrounded (replaces the old manual host "skip turn").
+const TURN_GRACE_MS = 15000;
+const TURN_COUNTDOWN_MS = 30000;
+const TURN_MS = TURN_GRACE_MS + TURN_COUNTDOWN_MS; // 45s total before auto-skip
 
 function publicState(room) {
   return {
@@ -116,6 +125,8 @@ function publicState(room) {
     pendingBuddy: room.pendingBuddy,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
+    turnEndsAt: room.turnEndsAt || 0,
+    lastTimeout: room.lastTimeout || null,
     loser: room.loser,
     timer: room.timer,                 // {duration, endsAt(ms)} or null
     hostAwaySince: room.hostAwaySince || 0,
@@ -159,6 +170,15 @@ function advanceTurn(room) {
     if (room.players[idx] && room.players[idx].connected) { room.turn = idx; return; }
   }
   room.turn = (room.turn + 1) % n; // everyone else offline -> just move on
+}
+
+// (Re)arm the draw-phase auto-skip timer for whoever is now on turn. Self-clears
+// to 0 whenever we're NOT waiting for a draw (game not running, a card is already
+// flipped, fewer than 2 players, or the game is over) so the watchdog stays idle.
+function armTurn(room) {
+  room.turnEndsAt = (room.started && !room.flipped && room.players.length >= 2 && room.kings < 4)
+    ? Date.now() + TURN_MS
+    : 0;
 }
 
 /* ---- the registry / engine API used by the WS layer ---- */
@@ -209,7 +229,9 @@ export const roomEngine = {
         room.thumbMaster = null; room.questionMaster = null; room.pairs = [];
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
+        room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
+        armTurn(room);
         return { room };
       }
       case "draw": {
@@ -229,6 +251,7 @@ export const roomEngine = {
         }
         room.card = next; room.flipped = true;
         room.timer = null; // fresh card -> no timer yet
+        armTurn(room);     // card is up -> draw-phase timer off
         return { room };
       }
       case "timer": {
@@ -265,6 +288,7 @@ export const roomEngine = {
         room.flipped = false; room.card = null;
         room.timer = null;
         advanceTurn(room);
+        armTurn(room);
         return { room };
       }
       case "skip": {
@@ -274,6 +298,7 @@ export const roomEngine = {
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
         advanceTurn(room);
+        armTurn(room);
         return { room };
       }
       case "leave": {
@@ -290,6 +315,7 @@ export const roomEngine = {
             room.lastLeft = { name: p.name, at: Date.now() };
             const idx = room.players.findIndex((x) => x.id === playerId);
             removePlayerAt(room, idx);
+            armTurn(room);
           }
         }
         return { room };
@@ -301,6 +327,7 @@ export const roomEngine = {
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.loser = null; room.turn = 0;
+        room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
         return { room };
       }
@@ -332,6 +359,16 @@ export const roomEngine = {
         room.closed = true;
         room.hostAwaySince = 0;
         changed.push(room);
+      }
+      // Turn auto-skip: the active player didn't draw within TURN_MS -> pass the
+      // turn on and flag that they must take a sip/shot (was the manual host skip).
+      if (room.started && !room.closed && !room.flipped && room.kings < 4 &&
+          room.players.length >= 2 && room.turnEndsAt && now >= room.turnEndsAt) {
+        const cur = room.players[room.turn];
+        if (cur) room.lastTimeout = { name: cur.name, at: now };
+        advanceTurn(room);
+        armTurn(room);
+        if (!changed.includes(room)) changed.push(room);
       }
     }
     return changed;
