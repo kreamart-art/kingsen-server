@@ -98,7 +98,7 @@ function rowToPublic(row, liked) {
 /* ---- app ---- */
 const app = express();
 app.set("trust proxy", 1); // behind nginx/caddy
-app.use(express.json({ limit: "16kb" }));
+app.use(express.json({ limit: "128kb" })); // room create/join carry a small avatar data URL
 app.use(cors({
   origin: ORIGINS.includes("*") ? true : ORIGINS,
   methods: ["GET", "POST"],
@@ -217,6 +217,46 @@ app.post("/sets/:id/report", writeLimiter, (req, res) => {
 });
 
 app.get("/ws-health", (_req, res) => res.json({ ok: true, ...roomEngine.stats() }));
+
+/* ---- HTTP polling transport for online play (alternative to /ws) ----
+   Same authoritative roomEngine as the WebSocket. A turn-based game doesn't need
+   a persistent socket: the client POSTs actions and GETs the state every ~1.5s.
+   There's no connection to go half-open, so it can't "miss the last broadcast"
+   and freeze — every poll returns the current state. */
+const rl = rateLimit({ windowMs: 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, message: { error: "Slow down" } });
+
+app.post("/api/room", rl, (req, res) => {
+  const b = req.body || {};
+  if (!b.playerId) return res.status(400).json({ error: "Missing playerId" });
+  const room = roomEngine.create({ hostId: b.playerId, name: b.name, setCode: b.setCode, setName: b.setName, lang: b.lang, alcoholFree: b.alcoholFree, avatar: b.avatar });
+  roomEngine.touch(room.code, b.playerId);
+  res.json({ code: room.code, hostId: room.hostId, playerId: b.playerId, state: roomEngine.publicState(room) });
+});
+
+app.post("/api/room/:code/join", rl, (req, res) => {
+  const b = req.body || {};
+  if (!b.playerId) return res.status(400).json({ error: "Missing playerId" });
+  const r = roomEngine.join({ code: req.params.code, playerId: b.playerId, name: b.name, avatar: b.avatar });
+  if (r.error) return res.status(409).json({ error: r.error });
+  roomEngine.touch(r.room.code, b.playerId);
+  res.json({ code: r.room.code, hostId: r.room.hostId, playerId: b.playerId, state: roomEngine.publicState(r.room) });
+});
+
+app.get("/api/room/:code", rl, (req, res) => {
+  const pid = req.query.pid ? String(req.query.pid) : null;
+  const room = pid ? roomEngine.touch(req.params.code, pid) : roomEngine.get(req.params.code);
+  if (!room) return res.status(404).json({ error: "Room niet gevonden" });
+  res.json({ code: room.code, hostId: room.hostId, state: roomEngine.publicState(room) });
+});
+
+app.post("/api/room/:code/action", rl, (req, res) => {
+  const b = req.body || {};
+  if (!b.playerId) return res.status(400).json({ error: "Missing playerId" });
+  roomEngine.touch(req.params.code, b.playerId);
+  const r = roomEngine.action(req.params.code, b.playerId, b.action, b.payload);
+  if (r.error) return res.status(409).json({ error: r.error });
+  res.json({ code: r.room.code, hostId: r.room.hostId, state: roomEngine.publicState(r.room) });
+});
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 

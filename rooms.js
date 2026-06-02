@@ -151,6 +151,11 @@ const HOST_GRACE_MS = 10000;            // deliberate host LEAVE -> close after 
 // tab). A 10s window closed the room before recovery and kicked everyone — so a
 // drop now waits this long before the room closes.
 const HOST_DISCONNECT_GRACE_MS = 45000;
+// HTTP-polling transport: each GET/POST "touches" the player (sets lastSeen). A
+// poller not seen within this window is treated as disconnected. > a few missed
+// ~1.5s polls. Polling has no fragile persistent socket, so it can't "miss the
+// last broadcast" — every poll returns the current authoritative state.
+const POLL_TIMEOUT_MS = 9000;
 
 function currentPlayer(room) { return room.players[room.turn]; }
 
@@ -361,6 +366,18 @@ export const roomEngine = {
     return room;
   },
 
+  // HTTP-polling keepalive: a poll/action marks the player present (lastSeen).
+  // Mirrors a WS message arriving. Cancels the host-away clock if the host is back.
+  touch(code, playerId) {
+    const room = rooms.get((code || "").toUpperCase());
+    if (!room) return null;
+    const p = room.players.find((x) => x.id === playerId);
+    if (p) { p.connected = true; p.lastSeen = Date.now(); }
+    if (playerId === room.hostId) room.hostAwaySince = 0;
+    room.touchedAt = Date.now();
+    return room;
+  },
+
   // Returns the list of rooms whose state changed this tick (host-grace expiry),
   // so the WS layer can broadcast the "closed" state to remaining players.
   tick() {
@@ -373,6 +390,18 @@ export const roomEngine = {
         room.closed = true;
         room.hostAwaySince = 0;
         changed.push(room);
+      }
+      // Polling players: mark gone if not seen within POLL_TIMEOUT_MS (each poll/
+      // action touches lastSeen). WS players never set lastSeen, so they're
+      // unaffected here (their connected flag is driven by socket open/close).
+      for (const p of room.players) {
+        if (p.lastSeen && p.connected && now - p.lastSeen > POLL_TIMEOUT_MS) {
+          p.connected = false;
+          if (p.id === room.hostId && room.started && !room.closed && !room.hostAwaySince) {
+            room.hostAwaySince = now; room.hostGraceMs = HOST_DISCONNECT_GRACE_MS;
+          }
+          if (!changed.includes(room)) changed.push(room);
+        }
       }
       // Periodic state heartbeat: re-push every active room so clients converge
       // to the server's truth even if they dropped a message (the game-over
