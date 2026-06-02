@@ -91,6 +91,7 @@ function newRoom(code, hostId, opts) {
     loser: null,
     timer: null,                       // {duration, endsAt} when running, else null
     hostAwaySince: 0,                  // ms timestamp when host disconnected (0 = present)
+    hostGraceMs: 0,                    // how long to wait before closing (set per cause: leave vs drop)
     lastLeft: null,                    // {name, at} of the most recent guest who left
     closed: false,                     // host left and grace expired
     createdAt: Date.now(),
@@ -144,7 +145,12 @@ function publicState(room) {
   };
 }
 
-const HOST_GRACE_MS = 10000; // host can rejoin within 10s before the room closes
+const HOST_GRACE_MS = 10000;            // deliberate host LEAVE -> close after this
+// A host CONNECTION DROP gets a MUCH longer grace: a mobile blip kills the socket
+// and the client needs ~10-20s+ to detect it and reconnect (longer on a throttled
+// tab). A 10s window closed the room before recovery and kicked everyone — so a
+// drop now waits this long before the room closes.
+const HOST_DISCONNECT_GRACE_MS = 45000;
 
 function currentPlayer(room) { return room.players[room.turn]; }
 
@@ -311,7 +317,7 @@ export const roomEngine = {
           // Host leaving = pause the room; 10s grace, then tick() closes it and
           // everyone is kicked. Keep the host in the list so they can rejoin.
           if (p) p.connected = false;
-          if (room.started && !room.closed) room.hostAwaySince = Date.now();
+          if (room.started && !room.closed) { room.hostAwaySince = Date.now(); room.hostGraceMs = HOST_GRACE_MS; }
         } else {
           // A guest (invited player) leaving does NOT affect the room: remove
           // them entirely and fix the turn pointer so play continues.
@@ -345,9 +351,11 @@ export const roomEngine = {
     if (!room) return null;
     const p = room.players.find((x) => x.id === playerId);
     if (p) p.connected = false;
-    // If the host drops while a game is in progress, start the 10s grace clock.
+    // If the host drops while a game is in progress, start the (long) grace clock
+    // so a mobile blip doesn't kill the room before the client reconnects.
     if (playerId === room.hostId && room.started && !room.closed && !room.hostAwaySince) {
       room.hostAwaySince = Date.now();
+      room.hostGraceMs = HOST_DISCONNECT_GRACE_MS;
     }
     room.touchedAt = Date.now();
     return room;
@@ -361,7 +369,7 @@ export const roomEngine = {
     tickCount++;
     const rebroadcast = tickCount % REBROADCAST_EVERY === 0;
     for (const [, room] of rooms) {
-      if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= HOST_GRACE_MS) {
+      if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= (room.hostGraceMs || HOST_GRACE_MS)) {
         room.closed = true;
         room.hostAwaySince = 0;
         changed.push(room);
