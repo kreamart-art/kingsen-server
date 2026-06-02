@@ -233,6 +233,25 @@ function broadcast(room) {
     }
   }
 }
+// A reconnect (heartbeat re-join from the same player) leaves the OLD socket
+// behind. Drop it so there's exactly one live socket per player — otherwise the
+// dead socket's late close marks the player offline AFTER they reconnected (and
+// would re-arm the host-away grace, closing a room whose host is actually here).
+function supersedeOldSockets(ws) {
+  for (const c of wss.clients) {
+    if (c !== ws && c._code === ws._code && c._pid === ws._pid) {
+      c._superseded = true;
+      try { c.terminate(); } catch { /* */ }
+    }
+  }
+}
+// Is another live socket already serving this player in this room?
+function hasLiveSibling(ws) {
+  for (const c of wss.clients) {
+    if (c !== ws && c.readyState === 1 && c._code === ws._code && c._pid === ws._pid) return true;
+  }
+  return false;
+}
 
 wss.on("connection", (ws) => {
   ws._code = null;
@@ -248,6 +267,7 @@ wss.on("connection", (ws) => {
         setName: m.setName, lang: m.lang, alcoholFree: m.alcoholFree, avatar: m.avatar,
       });
       ws._code = room.code; ws._pid = m.playerId;
+      supersedeOldSockets(ws);
       send(ws, { t: "joined", code: room.code, playerId: m.playerId, hostId: room.hostId });
       broadcast(room);
       return;
@@ -256,6 +276,7 @@ wss.on("connection", (ws) => {
       const r = roomEngine.join({ code: m.code, playerId: m.playerId, name: m.name, avatar: m.avatar });
       if (r.error) { send(ws, { t: "error", error: r.error }); return; }
       ws._code = r.room.code; ws._pid = m.playerId;
+      supersedeOldSockets(ws);
       send(ws, { t: "joined", code: r.room.code, playerId: m.playerId, hostId: r.room.hostId });
       broadcast(r.room);
       return;
@@ -269,10 +290,14 @@ wss.on("connection", (ws) => {
     if (m.t === "ping") { send(ws, { t: "pong" }); return; }
   });
   ws.on("close", () => {
-    if (ws._code && ws._pid) {
-      const room = roomEngine.disconnect(ws._code, ws._pid);
-      if (room) broadcast(room);
-    }
+    if (!ws._code || !ws._pid) return;
+    // Reconnect-race guard: if a newer live socket already serves this player
+    // (they reconnected), this socket was superseded — its close must NOT mark
+    // the player offline or re-arm the host-away grace, or a present host's room
+    // would wrongly close ~10s later. Only the player's LAST socket disconnects.
+    if (ws._superseded || hasLiveSibling(ws)) return;
+    const room = roomEngine.disconnect(ws._code, ws._pid);
+    if (room) broadcast(room);
   });
 });
 
