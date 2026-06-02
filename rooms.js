@@ -58,6 +58,10 @@ function makeCode() {
 
 const rooms = new Map();          // code -> room
 const ROOM_TTL_MS = 1000 * 60 * 60 * 3; // reap empty rooms after 3h idle
+let tickCount = 0;
+const REBROADCAST_EVERY = 3;      // ticks (~3s): re-push active-room state so a client
+                                  // that missed a broadcast (esp. the LAST one = game-over)
+                                  // self-heals instead of freezing forever.
 
 function newRoom(code, hostId, opts) {
   return {
@@ -354,12 +358,18 @@ export const roomEngine = {
   tick() {
     const now = Date.now();
     const changed = [];
+    tickCount++;
+    const rebroadcast = tickCount % REBROADCAST_EVERY === 0;
     for (const [, room] of rooms) {
       if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= HOST_GRACE_MS) {
         room.closed = true;
         room.hostAwaySince = 0;
         changed.push(room);
       }
+      // Periodic state heartbeat: re-push every active room so clients converge
+      // to the server's truth even if they dropped a message (the game-over
+      // broadcast is the last one — a dropped one would otherwise freeze them).
+      if (rebroadcast && room.started && !room.closed && !changed.includes(room)) changed.push(room);
       // Turn auto-skip: the active player didn't draw within TURN_MS -> pass the
       // turn on and flag that they must take a sip/shot (was the manual host skip).
       if (room.started && !room.closed && !room.flipped && room.kings < 4 &&
