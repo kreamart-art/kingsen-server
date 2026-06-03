@@ -100,13 +100,13 @@ function newRoom(code, hostId, opts) {
 }
 
 const RULE_MS = 60000; // 60s to invent a mandatory house rule
-// Auto-skip a stalled turn: the active player gets a 15s grace, then a 30s
+// Auto-skip a stalled turn: the active player gets a 15s grace, then a 15s
 // visible countdown; if they STILL haven't drawn, their turn is passed on and
 // they must take a sip/shot. Server-authoritative so it fires even if their app
 // is backgrounded (replaces the old manual host "skip turn").
 const TURN_GRACE_MS = 15000;
-const TURN_COUNTDOWN_MS = 30000;
-const TURN_MS = TURN_GRACE_MS + TURN_COUNTDOWN_MS; // 45s total before auto-skip
+const TURN_COUNTDOWN_MS = 15000;
+const TURN_MS = TURN_GRACE_MS + TURN_COUNTDOWN_MS; // 30s total before auto-skip
 
 function publicState(room) {
   return {
