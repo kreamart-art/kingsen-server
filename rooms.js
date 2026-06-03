@@ -84,6 +84,7 @@ function newRoom(code, hostId, opts) {
     pairs: [],                         // [[a,b],...]
     houseRules: [],
     pendingBuddy: false,
+    spinPick: null,                    // Boer/neighbour: name the wheel landed on (server-chosen, so every client lands the same)
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
     turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
@@ -131,6 +132,7 @@ function publicState(room) {
     pairs: room.pairs,
     houseRules: room.houseRules,
     pendingBuddy: room.pendingBuddy,
+    spinPick: room.spinPick || null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -261,9 +263,18 @@ export const roomEngine = {
         const eff = room.effects[next.rank];
         cur.cards += 1;
         if (next.rank === "3") cur.threes += 1;
+        room.spinPick = null;                      // clear any previous wheel result
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
+        if (eff === "neighbor") {
+          // Online there's no physical left-neighbour, so the "wheel" picks a
+          // random PRESENT player (preferring someone other than the drawer).
+          // Server-chosen so every client's spin lands on the same person.
+          const pool = room.players.filter((p) => p.connected && p.id !== cur.id);
+          const pick = pool.length ? pool[Math.floor(Math.random() * pool.length)] : cur;
+          room.spinPick = pick.name;
+        }
         if (eff === "newrule") { room.pendingRule = true; room.ruleEndsAt = Date.now() + RULE_MS; }
         if (eff === "king") {
           room.kings += 1;
