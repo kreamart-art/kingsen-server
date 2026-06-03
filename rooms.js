@@ -84,7 +84,10 @@ function newRoom(code, hostId, opts) {
     pairs: [],                         // [[a,b],...]
     houseRules: [],
     pendingBuddy: false,
-    spinPick: null,                    // Boer/neighbour: name the wheel landed on (server-chosen, so every client lands the same)
+    spinPick: null,                    // Boer/neighbour: name the wheel landed on to DRINK (server-chosen, so every client lands the same)
+    spinGiver: null,                   // Boer/neighbour: name the wheel chose to DEAL OUT (Boer B = "one deals, one drinks")
+    pendingKingShot: false,            // Koning B: drawer must assign a king's shot (kings 1-3)
+    kingShotTarget: null,              // Koning B: who the drawer sent the shot to
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
     turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
@@ -133,6 +136,9 @@ function publicState(room) {
     houseRules: room.houseRules,
     pendingBuddy: room.pendingBuddy,
     spinPick: room.spinPick || null,
+    spinGiver: room.spinGiver || null,
+    pendingKingShot: !!room.pendingKingShot,
+    kingShotTarget: room.kingShotTarget || null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -177,6 +183,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
   }
 }
 
@@ -252,6 +259,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
         armTurn(room);
         return { room };
@@ -263,22 +271,30 @@ export const roomEngine = {
         const eff = room.effects[next.rank];
         cur.cards += 1;
         if (next.rank === "3") cur.threes += 1;
-        room.spinPick = null;                      // clear any previous wheel result
+        room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
+        room.pendingKingShot = false; room.kingShotTarget = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
         if (eff === "neighbor") {
-          // Online there's no physical left-neighbour, so the "wheel" picks a
-          // random PRESENT player (preferring someone other than the drawer).
-          // Server-chosen so every client's spin lands on the same person.
-          const pool = room.players.filter((p) => p.connected && p.id !== cur.id);
-          const pick = pool.length ? pool[Math.floor(Math.random() * pool.length)] : cur;
-          room.spinPick = pick.name;
+          // Boer B: the wheel picks TWO present players — one deals out, one drinks.
+          // Server-chosen so every client's spin lands on the same people.
+          const pool = room.players.filter((p) => p.connected);
+          if (pool.length >= 2) {
+            const di = Math.floor(Math.random() * pool.length);
+            let gi = Math.floor(Math.random() * (pool.length - 1)); if (gi >= di) gi += 1; // distinct
+            room.spinPick = pool[di].name;    // drinks
+            room.spinGiver = pool[gi].name;   // deals out
+          } else {
+            const only = pool[0] || cur;
+            room.spinPick = only.name; room.spinGiver = only.name;
+          }
         }
         if (eff === "newrule") { room.pendingRule = true; room.ruleEndsAt = Date.now() + RULE_MS; }
         if (eff === "king") {
           room.kings += 1;
           if (room.kings >= 4) room.loser = cur.name;
+          else { room.pendingKingShot = true; room.kingShotTarget = null; } // Koning B: kings 1-3 -> assign a shot
         }
         room.card = next; room.flipped = true;
         room.timer = null; // fresh card -> no timer yet
@@ -298,6 +314,13 @@ export const roomEngine = {
         if (name) { room.pairs.push([cur.name, name]); room.pendingBuddy = false; }
         return { room };
       }
+      case "kingshot": {
+        // Koning B: the drawer assigns the king's shot to a player.
+        if (!isTurn) return { error: "Niet jouw beurt" };
+        const name = cleanName(payload && payload.name);
+        if (name) { room.kingShotTarget = name; room.pendingKingShot = false; }
+        return { room };
+      }
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
@@ -305,16 +328,21 @@ export const roomEngine = {
         return { room };
       }
       case "removerule": {
-        // active player may strike a single house rule (e.g. one that no longer fits)
+        // Only offered while the active player is on a "new rule" card: instead of
+        // inventing a rule they may strike an existing one. That counts as their move,
+        // so it also satisfies the mandatory-rule prompt.
         if (!isTurn) return { error: "Niet jouw beurt" };
         const i = Number(payload && payload.index);
         if (Number.isInteger(i) && i >= 0 && i < room.houseRules.length) room.houseRules.splice(i, 1);
+        room.pendingRule = false; room.ruleEndsAt = 0;
         return { room };
       }
       case "clearrules": {
         // active player declares "from now on, no rules apply" -> wipe them all
+        // (their move on the new-rule card; clears the mandatory-rule prompt).
         if (!isTurn) return { error: "Niet jouw beurt" };
         room.houseRules = [];
+        room.pendingRule = false; room.ruleEndsAt = 0;
         return { room };
       }
       case "ruletimeout": {
@@ -328,9 +356,12 @@ export const roomEngine = {
       case "next": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         if (room.pendingBuddy) return { error: "Kies eerst een drinkmaatje" };
+        if (room.pendingKingShot) return { error: "Kies eerst wie drinkt" };
         if (room.pendingRule) return { error: "Verzin eerst een regel" };
         room.flipped = false; room.card = null;
         room.timer = null;
+        room.spinPick = null; room.spinGiver = null;
+        room.pendingKingShot = false; room.kingShotTarget = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -341,6 +372,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -370,6 +402,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
