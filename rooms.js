@@ -301,7 +301,20 @@ export const roomEngine = {
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
-        if (txt) { room.houseRules.push(txt); room.pendingRule = false; room.ruleEndsAt = 0; }
+        if (txt) { room.houseRules.push({ text: txt, by: cur.name }); room.pendingRule = false; room.ruleEndsAt = 0; }
+        return { room };
+      }
+      case "removerule": {
+        // active player may strike a single house rule (e.g. one that no longer fits)
+        if (!isTurn) return { error: "Niet jouw beurt" };
+        const i = Number(payload && payload.index);
+        if (Number.isInteger(i) && i >= 0 && i < room.houseRules.length) room.houseRules.splice(i, 1);
+        return { room };
+      }
+      case "clearrules": {
+        // active player declares "from now on, no rules apply" -> wipe them all
+        if (!isTurn) return { error: "Niet jouw beurt" };
+        room.houseRules = [];
         return { room };
       }
       case "ruletimeout": {
