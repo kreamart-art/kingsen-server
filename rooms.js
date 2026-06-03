@@ -94,6 +94,9 @@ function newRoom(code, hostId, opts) {
     hostGraceMs: 0,                    // how long to wait before closing (set per cause: leave vs drop)
     lastLeft: null,                    // {name, at} of the most recent guest who left
     closed: false,                     // host left and grace expired
+    rev: 0,                            // monotonic state revision: lets clients drop
+                                       // out-of-order (stale) responses so a late poll
+                                       // can't clobber a freshly-drawn card.
     createdAt: Date.now(),
     touchedAt: Date.now(),
   };
@@ -137,6 +140,7 @@ function publicState(room) {
     hostAwaySince: room.hostAwaySince || 0,
     lastLeft: room.lastLeft || null,
     closed: !!room.closed,
+    rev: room.rev || 0,
     // Sticky: once the 4th king is drawn the game is over and STAYS over until a
     // restart (which resets kings to 0). loser is already persisted, so a client
     // that was mid-reconnect when the king landed still sees the end on rejoin —
@@ -231,6 +235,7 @@ export const roomEngine = {
     const room = rooms.get((code || "").toUpperCase());
     if (!room) return { error: "Room niet gevonden" };
     room.touchedAt = Date.now();
+    room.rev = (room.rev || 0) + 1; // every action advances the revision (atomic in Node)
     const cur = currentPlayer(room);
     const isHost = playerId === room.hostId;
     const isTurn = cur && cur.id === playerId;
@@ -389,6 +394,7 @@ export const roomEngine = {
       if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= (room.hostGraceMs || HOST_GRACE_MS)) {
         room.closed = true;
         room.hostAwaySince = 0;
+        room.rev = (room.rev || 0) + 1;
         changed.push(room);
       }
       // Polling players: mark gone if not seen within POLL_TIMEOUT_MS (each poll/
@@ -397,6 +403,7 @@ export const roomEngine = {
       for (const p of room.players) {
         if (p.lastSeen && p.connected && now - p.lastSeen > POLL_TIMEOUT_MS) {
           p.connected = false;
+          room.rev = (room.rev || 0) + 1;
           if (p.id === room.hostId && room.started && !room.closed && !room.hostAwaySince) {
             room.hostAwaySince = now; room.hostGraceMs = HOST_DISCONNECT_GRACE_MS;
           }
@@ -415,6 +422,7 @@ export const roomEngine = {
         if (cur) room.lastTimeout = { name: cur.name, at: now };
         advanceTurn(room);
         armTurn(room);
+        room.rev = (room.rev || 0) + 1;
         if (!changed.includes(room)) changed.push(room);
       }
     }
