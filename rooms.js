@@ -88,6 +88,8 @@ function newRoom(code, hostId, opts) {
     spinGiver: null,                   // Boer/neighbour: name the wheel chose to DEAL OUT (Boer B = "one deals, one drinks")
     pendingKingShot: false,            // Koning B: drawer must assign a king's shot (kings 1-3)
     kingShotTarget: null,              // Koning B: who the drawer sent the shot to
+    race: null,                        // Hemel B: { kind:"heaven", openAt, taps:[{id,name,at}] } — tap race, last drinks
+    chain: null,                       // Waterval B: { order:[id...from drawer], stopped:[id] } — tap-chain
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
     turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
@@ -139,6 +141,8 @@ function publicState(room) {
     spinGiver: room.spinGiver || null,
     pendingKingShot: !!room.pendingKingShot,
     kingShotTarget: room.kingShotTarget || null,
+    race: room.race || null,
+    chain: room.chain || null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -183,7 +187,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
   }
 }
 
@@ -259,7 +263,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
         armTurn(room);
         return { room };
@@ -273,7 +277,16 @@ export const roomEngine = {
         if (next.rank === "3") cur.threes += 1;
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
+        room.race = null; room.chain = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
+        if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
+          room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
+        }
+        if (eff === "waterfall") {                     // Waterval B: tap-chain in turn order from the drawer
+          const n = room.players.length, order = [];
+          for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+          room.chain = { order, stopped: [] };
+        }
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
         if (eff === "neighbor") {
@@ -321,6 +334,22 @@ export const roomEngine = {
         if (name) { room.kingShotTarget = name; room.pendingKingShot = false; }
         return { room };
       }
+      case "tap": {
+        // Hemel B: anyone taps once the race window is open; arrival order is
+        // authoritative (last to tap = loser). No turn check — everyone races.
+        if (!room.race) return { room };
+        const now = Date.now();
+        if (now < room.race.openAt) return { room };          // before 3-2-1 ends: ignore (no false starts)
+        const me = room.players.find((p) => p.id === playerId);
+        if (me && !room.race.taps.some((t) => t.id === playerId)) room.race.taps.push({ id: playerId, name: me.name, at: now });
+        return { room };
+      }
+      case "waterstop": {
+        // Waterval B: you may only stop once the player before you in the chain has.
+        if (!room.chain) return { room };
+        if (room.chain.order[room.chain.stopped.length] === playerId) room.chain.stopped.push(playerId);
+        return { room };
+      }
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
@@ -362,6 +391,7 @@ export const roomEngine = {
         room.timer = null;
         room.spinPick = null; room.spinGiver = null;
         room.pendingKingShot = false; room.kingShotTarget = null;
+        room.race = null; room.chain = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -372,7 +402,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -402,7 +432,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
