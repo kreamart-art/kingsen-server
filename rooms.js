@@ -91,6 +91,7 @@ function newRoom(code, hostId, opts) {
     race: null,                        // Hemel B: { kind:"heaven", openAt, taps:[{id,name,at}] } — tap race, last drinks
     chain: null,                       // Waterval B: { order:[id...from drawer], stopped:[id] } — tap-chain
     thumbRace: null,                   // Duimbaas A: { openAt, taps:[{id,name,at}] } — anytime thumb-master race
+    juf: null,                         // JUF (Sevens) mini-game: { phase, order:[id], count, turnIndex, deadline, ready:{id:bool}, lastResult, overSince, readyAt }
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
     turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
@@ -145,6 +146,7 @@ function publicState(room) {
     race: room.race || null,
     chain: room.chain || null,
     thumbRace: room.thumbRace || null,
+    juf: room.juf || null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -189,7 +191,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
   }
 }
 
@@ -213,6 +215,32 @@ function armTurn(room) {
   room.turnEndsAt = (room.started && !room.flipped && room.players.length >= 2 && room.kings < 4)
     ? Date.now() + TURN_MS
     : 0;
+}
+
+/* ---- JUF (Sevens) mini-game helpers — server-authoritative ---- */
+const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
+function jufDeadlineFor(count) { return Date.now() + Math.max(JUF_MIN_MS, JUF_START_MS - JUF_STEP_MS * (count - 1)); }
+function jufIsJuf(n) { return (n % 7 === 0) || String(n).includes("7"); }
+// reason CODE (client localizes): "multiple" | "contains" | "saidjuf" | "slow"
+function jufReasonCode(n) { return n % 7 === 0 ? "multiple" : "contains"; }
+function jufConnectedIds(room) {
+  return (room.juf ? room.juf.order : []).filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected; });
+}
+// Move JUF turn to the next CONNECTED player in the fixed order; (re)arm the timer.
+function jufAdvance(room) {
+  const J = room.juf, ord = J.order, n = ord.length;
+  for (let step = 1; step <= n; step++) {
+    const idx = (J.turnIndex + step) % n;
+    const p = room.players.find((x) => x.id === ord[idx]);
+    if (p && p.connected) { J.turnIndex = idx; break; }
+  }
+  J.deadline = jufDeadlineFor(J.count);
+}
+function jufLose(room, id, reason, number) {
+  const p = room.players.find((x) => x.id === id);
+  room.juf.phase = "over";
+  room.juf.overSince = Date.now();
+  room.juf.lastResult = { drinkerId: id, drinkerName: p ? p.name : "", reason, number };
 }
 
 /* ---- the registry / engine API used by the WS layer ---- */
@@ -265,7 +293,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
         armTurn(room);
         return { room };
@@ -279,7 +307,7 @@ export const roomEngine = {
         if (next.rank === "3") cur.threes += 1;
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
-        room.race = null; room.chain = null;
+        room.race = null; room.chain = null; room.juf = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -288,6 +316,11 @@ export const roomEngine = {
           const n = room.players.length, order = [];
           for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
           room.chain = { order, stopped: [] };
+        }
+        if (eff === "counting") {                       // JUF (Sevens): launch the turn-based mini-game for everyone
+          const n = room.players.length, order = [];
+          for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+          room.juf = { phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
         }
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
@@ -368,6 +401,38 @@ export const roomEngine = {
         if (me && !room.thumbRace.taps.some((t) => t.id === playerId)) room.thumbRace.taps.push({ id: playerId, name: me.name, at: Date.now() });
         return { room };
       }
+      case "jufready": {
+        const J = room.juf;
+        if (!J || J.phase !== "ready") return { room };
+        J.ready[playerId] = (payload && typeof payload.on === "boolean") ? payload.on : !J.ready[playerId];
+        return { room };
+      }
+      case "jufstart": {
+        if (!isHost) return { error: "Alleen de host kan starten" };
+        const J = room.juf;
+        if (!J || J.phase !== "ready") return { room };
+        const conn = jufConnectedIds(room);
+        if (conn.length < 1 || !conn.every((id) => J.ready[id])) return { error: "Nog niet iedereen is klaar" };
+        J.phase = "playing"; J.count = 1; J.turnIndex = -1;
+        jufAdvance(room);                 // lands turnIndex on the first connected player + arms the timer
+        J.deadline = Date.now() + JUF_START_MS; // first turn gets the full window
+        return { room };
+      }
+      case "jufanswer": {
+        const J = room.juf;
+        if (!J || J.phase !== "playing") return { room };
+        if (J.order[J.turnIndex] !== playerId) return { error: "Niet jouw beurt" };
+        const n = J.count;
+        const expected = jufIsJuf(n) ? "juf" : "number";
+        const ans = (payload && payload.answer === "juf") ? "juf" : "number";
+        if (ans === expected) {
+          J.count = n + 1;
+          jufAdvance(room);               // next connected player + shorter timer
+        } else {
+          jufLose(room, playerId, jufIsJuf(n) ? jufReasonCode(n) : "saidjuf", n);
+        }
+        return { room };
+      }
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
@@ -404,12 +469,13 @@ export const roomEngine = {
         if (!isTurn) return { error: "Niet jouw beurt" };
         if (room.pendingBuddy) return { error: "Kies eerst een drinkmaatje" };
         if (room.pendingKingShot) return { error: "Kies eerst wie drinkt" };
+        if (room.juf && room.juf.phase !== "done") return { error: "JUF is bezig" };
         if (room.pendingRule) return { error: "Verzin eerst een regel" };
         room.flipped = false; room.card = null;
         room.timer = null;
         room.spinPick = null; room.spinGiver = null;
         room.pendingKingShot = false; room.kingShotTarget = null;
-        room.race = null; room.chain = null;
+        room.race = null; room.chain = null; room.juf = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -420,7 +486,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -450,7 +516,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
@@ -536,6 +602,23 @@ export const roomEngine = {
         room.thumbRace = null;
         room.rev = (room.rev || 0) + 1;
         if (!changed.includes(room)) changed.push(room);
+      }
+      // JUF: server-authoritative timer/lifecycle.
+      if (room.juf) {
+        const J = room.juf;
+        if (J.phase === "playing" && J.deadline && now >= J.deadline) {
+          jufLose(room, J.order[J.turnIndex], "slow", J.count);
+          room.rev = (room.rev || 0) + 1;
+          if (!changed.includes(room)) changed.push(room);
+        } else if (J.phase === "over" && now >= J.overSince + JUF_OVER_MS) {
+          J.phase = "done";
+          room.rev = (room.rev || 0) + 1;
+          if (!changed.includes(room)) changed.push(room);
+        } else if (J.phase === "ready" && J.readyAt && now >= J.readyAt + JUF_READY_MAX_MS) {
+          J.phase = "done";                 // safety: host never started -> don't freeze the card
+          room.rev = (room.rev || 0) + 1;
+          if (!changed.includes(room)) changed.push(room);
+        }
       }
     }
     return changed;
