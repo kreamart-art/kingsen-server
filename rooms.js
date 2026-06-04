@@ -217,7 +217,31 @@ function armTurn(room) {
     : 0;
 }
 
-/* ---- JUF (Sevens) mini-game helpers — server-authoritative ---- */
+/* ---- Turn-relay mini-games (JUF / Categorie / Rijmen) — server-authoritative ----
+   All three share one engine: ready -> playing -> over -> done, a fixed turn order,
+   a shrinking per-turn deadline, and "first to fail/too-slow drinks". JUF also
+   validates the answer (juf vs number); Categorie/Rijmen just need you to tap before
+   the timer (the naming/rhyming itself is social). The prompt is server-picked so
+   everyone sees the same category/word. */
+const RELAY_CATEGORIES = {
+  nl: ["Automerken", "Landen", "Dieren", "Voetbalclubs", "Cocktails", "Films", "Steden", "Beroepen", "Pizza-toppings", "Superhelden", "Fruit", "Biermerken", "Disney-films", "Lichaamsdelen", "Kleuren"],
+  en: ["Car brands", "Countries", "Animals", "Football clubs", "Cocktails", "Movies", "Cities", "Jobs", "Pizza toppings", "Superheroes", "Fruits", "Beer brands", "Disney movies", "Body parts", "Colours"],
+};
+const RELAY_RHYMES = {
+  nl: ["kat", "huis", "boom", "bier", "feest", "maan", "trein", "hand", "licht", "stoel", "zon", "kaas", "muur", "fiets", "hond"],
+  en: ["cat", "house", "tree", "beer", "night", "moon", "train", "hand", "light", "chair", "sun", "wall", "bike", "game", "star"],
+};
+function relayPrompt(mode, lang) {
+  const L = lang === "en" ? "en" : "nl";
+  if (mode === "category") { const a = RELAY_CATEGORIES[L]; return a[Math.floor(Math.random() * a.length)]; }
+  if (mode === "rhyme") { const a = RELAY_RHYMES[L]; return a[Math.floor(Math.random() * a.length)]; }
+  return null;
+}
+function startRelay(room, mode) {
+  const n = room.players.length, order = [];
+  for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+  room.juf = { mode, prompt: relayPrompt(mode, room.lang), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
+}
 const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
 function jufDeadlineFor(count) { return Date.now() + Math.max(JUF_MIN_MS, JUF_START_MS - JUF_STEP_MS * (count - 1)); }
 function jufIsJuf(n) { return (n % 7 === 0) || String(n).includes("7"); }
@@ -317,11 +341,9 @@ export const roomEngine = {
           for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
           room.chain = { order, stopped: [] };
         }
-        if (eff === "counting") {                       // JUF (Sevens): launch the turn-based mini-game for everyone
-          const n = room.players.length, order = [];
-          for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
-          room.juf = { phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
-        }
+        if (eff === "counting") startRelay(room, "juf");        // JUF (Sevens)
+        if (eff === "category") startRelay(room, "category");    // Categorie
+        if (eff === "rhyme") startRelay(room, "rhyme");          // Rijmen
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
         if (eff === "neighbor") {
@@ -423,13 +445,15 @@ export const roomEngine = {
         if (!J || J.phase !== "playing") return { room };
         if (J.order[J.turnIndex] !== playerId) return { error: "Niet jouw beurt" };
         const n = J.count;
-        const expected = jufIsJuf(n) ? "juf" : "number";
-        const ans = (payload && payload.answer === "juf") ? "juf" : "number";
-        if (ans === expected) {
+        if (J.mode === "category" || J.mode === "rhyme") {
+          // Categorie/Rijmen: a tap means "I named/rhymed one" — just pass it on.
           J.count = n + 1;
-          jufAdvance(room);               // next connected player + shorter timer
+          jufAdvance(room);
         } else {
-          jufLose(room, playerId, jufIsJuf(n) ? jufReasonCode(n) : "saidjuf", n);
+          const expected = jufIsJuf(n) ? "juf" : "number";
+          const ans = (payload && payload.answer === "juf") ? "juf" : "number";
+          if (ans === expected) { J.count = n + 1; jufAdvance(room); }
+          else { jufLose(room, playerId, jufIsJuf(n) ? jufReasonCode(n) : "saidjuf", n); }
         }
         return { room };
       }
