@@ -487,15 +487,24 @@ export const roomEngine = {
         return { room };
       }
       case "jufjudge": {
-        // Host override for Categorie/Rijmen: the app can't tell if a word was actually
-        // right, so the host can declare a player made a mistake -> that player drinks
-        // and the relay ends. Only mid-relay, host only, relay modes only.
+        // Categorie/Rijmen: the app can't judge a spoken word, so the host ends the round
+        // and decides. This enters (or stays in) the "decide" hold (phase "over"): a player
+        // id flags who drinks; an empty id = nobody (yet). The host then taps "continue".
         if (!isHost) return { error: "Alleen de host" };
         const J = room.juf;
-        if (!J || J.phase !== "playing" || !(J.mode === "category" || J.mode === "rhyme")) return { room };
+        if (!J || !(J.mode === "category" || J.mode === "rhyme")) return { room };
+        if (J.phase !== "playing" && J.phase !== "over") return { room };
+        if (J.phase !== "over") { J.phase = "over"; J.overSince = Date.now(); }
         const target = room.players.find((p) => p.id === (payload && payload.playerId));
-        if (!target) return { room };
-        jufLose(room, target.id, "judged", J.count);
+        J.lastResult = target ? { drinkerId: target.id, drinkerName: target.name, reason: "judged", number: J.count } : null;
+        return { room };
+      }
+      case "jufcontinue": {
+        // Categorie/Rijmen: host leaves the decide hold and goes on to the drawn card.
+        if (!isHost) return { error: "Alleen de host" };
+        const J = room.juf;
+        if (!J || J.phase !== "over") return { room };
+        J.phase = "done";
         return { room };
       }
       case "rule": {
@@ -675,7 +684,9 @@ export const roomEngine = {
           jufLose(room, J.order[J.turnIndex], "slow", J.count);
           room.rev = (room.rev || 0) + 1;
           if (!changed.includes(room)) changed.push(room);
-        } else if (J.phase === "over" && now >= J.overSince + JUF_OVER_MS) {
+        } else if (J.phase === "over" && now >= J.overSince + (((J.mode === "category" || J.mode === "rhyme")) ? 120000 : JUF_OVER_MS)) {
+          // Categorie/Rijmen: the host decides when to continue (this is just a 2-min safety so a
+          // forgotten room can't freeze). JUF (counting) still auto-advances after JUF_OVER_MS.
           J.phase = "done";
           room.rev = (room.rev || 0) + 1;
           if (!changed.includes(room)) changed.push(room);
