@@ -21,12 +21,30 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
+import { createHmac } from "node:crypto";
 import { openDatabase } from "./db.js";
 import { roomEngine } from "./rooms.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 8787;
+
+/* ---- Voice (WebRTC audio) — self-hosted ICE: STUN + TURN via coturn on this host.
+   The TURN secret stays server-side; we mint short-lived REST creds per client.
+   TURN_HOST/SECRET/REALM are overridable via env (Coolify). ---- */
+const TURN_HOST = process.env.TURN_HOST || "178.105.193.198";
+const TURN_SECRET = process.env.TURN_SECRET || "kingsenTurn_7Qf3nZ8mWp2xR5vK9aJ4bL6";
+const TURN_TTL = 12 * 60 * 60; // creds valid 12h
+function iceServers() {
+  const expiry = Math.floor(Date.now() / 1000) + TURN_TTL;
+  const username = String(expiry);
+  const credential = createHmac("sha1", TURN_SECRET).update(username).digest("base64");
+  return [
+    { urls: `stun:${TURN_HOST}:3478` },
+    { urls: "stun:stun.l.google.com:19302" }, // public fallback
+    { urls: [`turn:${TURN_HOST}:3478?transport=udp`, `turn:${TURN_HOST}:3478?transport=tcp`], username, credential },
+  ];
+}
 const DB_PATH = process.env.KINGSEN_DB || join(__dirname, "kingsen.db");
 // comma-separated allowlist, e.g. "https://kingsen.app,https://www.kingsen.app"
 // default "*" is fine for a public read/write gallery, but lock down for prod.
@@ -293,13 +311,45 @@ function hasLiveSibling(ws) {
   return false;
 }
 
+// Relay a voice message to every OTHER voice socket in the same room.
+function voiceBroadcast(code, msg, except) {
+  for (const c of wss.clients) {
+    if (c !== except && c.readyState === 1 && c._vcode === code && c._vpid) send(c, msg);
+  }
+}
+
 wss.on("connection", (ws) => {
   ws._code = null;
   ws._pid = null;
+  ws._vcode = null;   // voice room (separate from the game socket identity)
+  ws._vpid = null;
   ws.on("message", (buf) => {
     let m;
     try { m = JSON.parse(String(buf)); } catch { return; }
     if (!m || typeof m.t !== "string") return;
+
+    /* ---- Voice (WebRTC audio) signaling — rides on /ws, independent of game state ---- */
+    if (m.t === "voice-join") {
+      ws._vcode = String(m.code || "").toUpperCase(); ws._vpid = String(m.pid || "");
+      if (!ws._vcode || !ws._vpid) return;
+      const peers = [];
+      for (const c of wss.clients) if (c !== ws && c.readyState === 1 && c._vcode === ws._vcode && c._vpid) peers.push(c._vpid);
+      send(ws, { t: "voice-welcome", peers, iceServers: iceServers() });
+      voiceBroadcast(ws._vcode, { t: "voice-peer", pid: ws._vpid }, ws); // tell existing peers a newcomer arrived
+      return;
+    }
+    if (m.t === "voice-signal") {                 // relay an SDP offer/answer or ICE candidate to one peer
+      if (!ws._vcode || !ws._vpid) return;
+      for (const c of wss.clients) {
+        if (c.readyState === 1 && c._vcode === ws._vcode && c._vpid === m.to) { send(c, { t: "voice-signal", from: ws._vpid, data: m.data }); break; }
+      }
+      return;
+    }
+    if (m.t === "voice-leave") {
+      const code = ws._vcode, pid = ws._vpid; ws._vcode = null; ws._vpid = null;
+      if (code && pid) voiceBroadcast(code, { t: "voice-bye", pid }, ws);
+      return;
+    }
 
     if (m.t === "create") {
       const room = roomEngine.create({
@@ -330,6 +380,7 @@ wss.on("connection", (ws) => {
     if (m.t === "ping") { send(ws, { t: "pong" }); return; }
   });
   ws.on("close", () => {
+    if (ws._vcode && ws._vpid) { voiceBroadcast(ws._vcode, { t: "voice-bye", pid: ws._vpid }, ws); ws._vcode = null; ws._vpid = null; }
     if (!ws._code || !ws._pid) return;
     // Reconnect-race guard: if a newer live socket already serves this player
     // (they reconnected), this socket was superseded — its close must NOT mark
