@@ -74,6 +74,8 @@ function newRoom(code, hostId, opts) {
     effects: effectsFromCode(opts.setCode),
     players: [],                       // {id,name,connected,cards,threes}
     started: false,
+    gate: false,                       // pre-start "read the rules + ready up" gate (host opens it; game starts only when all are ready)
+    gateReady: {},                     // {id:true} players who tapped "I'm ready" on the rules screen
     deck: [],
     card: null,                        // last drawn {rank,sym,color}
     flipped: false,
@@ -129,6 +131,8 @@ function publicState(room) {
     alcoholFree: room.alcoholFree,
     players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar || "", connected: p.connected, cards: p.cards, threes: p.threes })),
     started: room.started,
+    gate: !!room.gate,
+    gateReady: room.gateReady || {},
     card: room.card,
     flipped: room.flipped,
     turn: room.turn,
@@ -308,9 +312,34 @@ export const roomEngine = {
     const isTurn = cur && cur.id === playerId;
 
     switch (type) {
+      case "opengate": {
+        // host opens the "read the rules + ready up" screen for everyone
+        if (!isHost) return { error: "Alleen de host kan starten" };
+        if (room.started) return { room };
+        if (room.players.length < 2) return { error: "Minimaal 2 spelers" };
+        room.gate = true; room.gateReady = {};
+        return { room };
+      }
+      case "closegate": {
+        // host backs out of the rules screen, returns everyone to the lobby
+        if (!isHost) return { error: "Alleen de host" };
+        room.gate = false; room.gateReady = {};
+        return { room };
+      }
+      case "gateready": {
+        // a player taps "I'm ready" (or un-readies) on the rules screen
+        if (!room.gate || room.started) return { room };
+        const on = !(payload && payload.on === false);
+        if (on) room.gateReady[playerId] = true; else delete room.gateReady[playerId];
+        return { room };
+      }
       case "start": {
         if (!isHost) return { error: "Alleen de host kan starten" };
         if (room.players.length < 2) return { error: "Minimaal 2 spelers" };
+        if (!room.gate) return { error: "Open eerst de regels" };
+        // every connected guest must have read the rules + tapped ready (the host's start click = host ready)
+        if (room.players.some((p) => p.connected && p.id !== room.hostId && !room.gateReady[p.id])) return { error: "Nog niet iedereen is klaar" };
+        room.gate = false; room.gateReady = {};
         room.started = true; room.deck = makeDeck(); room.turn = 0;
         room.card = null; room.flipped = false; room.kings = 0;
         room.thumbMaster = null; room.questionMaster = null; room.pairs = [];
@@ -536,7 +565,7 @@ export const roomEngine = {
       }
       case "restart": {
         if (!isHost) return { error: "Alleen de host kan herstarten" };
-        room.started = false; room.card = null; room.flipped = false;
+        room.started = false; room.gate = false; room.gateReady = {}; room.card = null; room.flipped = false;
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
@@ -663,8 +692,8 @@ export const roomEngine = {
   publicState,
 };
 
-function cleanName(n) { return String(n == null ? "" : n).replace(/[ -]/g, "").trim().slice(0, 18); }
-function cleanText(n) { return String(n == null ? "" : n).replace(/[ -]/g, "").trim().slice(0, 80); }
+function cleanName(n) { return String(n == null ? "" : n).replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 18); }
+function cleanText(n) { return String(n == null ? "" : n).replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 80); }
 // Avatar: only accept a small data:image URL (downscaled client-side); cap size.
 function cleanAvatar(a) {
   if (typeof a !== "string") return "";
