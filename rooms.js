@@ -486,6 +486,18 @@ export const roomEngine = {
         }
         return { room };
       }
+      case "jufjudge": {
+        // Host override for Categorie/Rijmen: the app can't tell if a word was actually
+        // right, so the host can declare a player made a mistake -> that player drinks
+        // and the relay ends. Only mid-relay, host only, relay modes only.
+        if (!isHost) return { error: "Alleen de host" };
+        const J = room.juf;
+        if (!J || J.phase !== "playing" || !(J.mode === "category" || J.mode === "rhyme")) return { room };
+        const target = room.players.find((p) => p.id === (payload && payload.playerId));
+        if (!target) return { room };
+        jufLose(room, target.id, "judged", J.count);
+        return { room };
+      }
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
