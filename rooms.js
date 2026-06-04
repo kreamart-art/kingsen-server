@@ -90,6 +90,7 @@ function newRoom(code, hostId, opts) {
     kingShotTarget: null,              // Koning B: who the drawer sent the shot to
     race: null,                        // Hemel B: { kind:"heaven", openAt, taps:[{id,name,at}] } — tap race, last drinks
     chain: null,                       // Waterval B: { order:[id...from drawer], stopped:[id] } — tap-chain
+    thumbRace: null,                   // Duimbaas A: { openAt, taps:[{id,name,at}] } — anytime thumb-master race
     pendingRule: false,                // active player drew a "new rule" card -> must add one
     ruleEndsAt: 0,                      // deadline (ms) to invent the rule; 0 = none
     turnEndsAt: 0,                      // deadline (ms) to draw before the turn auto-skips; 0 = none
@@ -143,6 +144,7 @@ function publicState(room) {
     kingShotTarget: room.kingShotTarget || null,
     race: room.race || null,
     chain: room.chain || null,
+    thumbRace: room.thumbRace || null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -187,7 +189,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
   }
 }
 
@@ -263,7 +265,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
         armTurn(room);
         return { room };
@@ -350,6 +352,22 @@ export const roomEngine = {
         if (room.chain.order[room.chain.stopped.length] === playerId) room.chain.stopped.push(playerId);
         return { room };
       }
+      case "thumbstart": {
+        // Duimbaas A: only the current thumb-master may trigger a screen-thumb race,
+        // and only one at a time. They count as the first (safe) tap. Everyone else
+        // races; the last to tap (or who never taps) drinks. Auto-expires in tick().
+        const me = room.players.find((p) => p.id === playerId);
+        if (!me || me.name !== room.thumbMaster) return { error: "Alleen de duim-baas" };
+        if (room.thumbRace) return { room };           // one round at a time
+        room.thumbRace = { openAt: Date.now(), taps: [{ id: me.id, name: me.name, at: Date.now() }] };
+        return { room };
+      }
+      case "thumbtap": {
+        if (!room.thumbRace) return { room };
+        const me = room.players.find((p) => p.id === playerId);
+        if (me && !room.thumbRace.taps.some((t) => t.id === playerId)) room.thumbRace.taps.push({ id: playerId, name: me.name, at: Date.now() });
+        return { room };
+      }
       case "rule": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const txt = cleanText(payload && payload.text);
@@ -402,7 +420,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -432,7 +450,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.thumbRace = null;
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
@@ -509,6 +527,13 @@ export const roomEngine = {
         if (cur) room.lastTimeout = { name: cur.name, at: now };
         advanceTurn(room);
         armTurn(room);
+        room.rev = (room.rev || 0) + 1;
+        if (!changed.includes(room)) changed.push(room);
+      }
+      // Duimbaas A: a thumb-master race auto-clears ~14s after it opened (enough
+      // to tap + read the reveal), so the role can trigger another one later.
+      if (room.thumbRace && now > room.thumbRace.openAt + 14000) {
+        room.thumbRace = null;
         room.rev = (room.rev || 0) + 1;
         if (!changed.includes(room)) changed.push(room);
       }
