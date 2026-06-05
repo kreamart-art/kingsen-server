@@ -90,6 +90,8 @@ function newRoom(code, hostId, opts) {
     spinGiver: null,                   // Boer/neighbour: name the wheel chose to DEAL OUT (Boer B = "one deals, one drinks")
     pendingKingShot: false,            // Koning B: drawer must assign a king's shot (kings 1-3)
     kingShotTarget: null,              // Koning B: who the drawer sent the shot to
+    pendingGive: false,                // give card (2): active player must pick who drinks
+    givePicks: [],                     // names picked to drink on the current give card (multi-select)
     race: null,                        // Hemel B: { kind:"heaven", openAt, taps:[{id,name,at}] } — tap race, last drinks
     chain: null,                       // Waterval B: { order:[id...from drawer], stopped:[id] } — tap-chain
     thumbRace: null,                   // Duimbaas A: { openAt, taps:[{id,name,at}] } — anytime thumb-master race
@@ -129,7 +131,7 @@ function publicState(room) {
     setName: room.setName,
     lang: room.lang,
     alcoholFree: room.alcoholFree,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar || "", connected: p.connected, cards: p.cards, threes: p.threes })),
+    players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar || "", connected: p.connected, cards: p.cards, threes: p.threes, drinks: p.drinks || 0 })),
     started: room.started,
     gate: !!room.gate,
     gateReady: room.gateReady || {},
@@ -147,6 +149,8 @@ function publicState(room) {
     spinGiver: room.spinGiver || null,
     pendingKingShot: !!room.pendingKingShot,
     kingShotTarget: room.kingShotTarget || null,
+    pendingGive: !!room.pendingGive,
+    givePicks: room.givePicks || [],
     race: room.race || null,
     chain: room.chain || null,
     thumbRace: room.thumbRace || null,
@@ -195,7 +199,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -277,7 +281,7 @@ export const roomEngine = {
     let code;
     do { code = makeCode(); } while (rooms.has(code));
     const room = newRoom(code, hostId, { setCode, setName, lang, alcoholFree });
-    room.players.push({ id: hostId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0 });
+    room.players.push({ id: hostId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0, drinks: 0 });
     rooms.set(code, room);
     return room;
   },
@@ -293,7 +297,7 @@ export const roomEngine = {
       // brand-new players can't join mid-game.
       if (room.started) return { error: "Spel al begonnen" };
       if (room.players.length >= 12) return { error: "Room vol" };
-      room.players.push({ id: playerId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0 });
+      room.players.push({ id: playerId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0, drinks: 0 });
     }
     if (playerId === room.hostId) room.hostAwaySince = 0; // host is back -> cancel grace
     room.touchedAt = Date.now();
@@ -346,8 +350,8 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
-        room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
+        room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
       }
@@ -360,6 +364,7 @@ export const roomEngine = {
         if (next.rank === "3") cur.threes += 1;
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
+        room.pendingGive = false; room.givePicks = [];
         room.race = null; room.chain = null; room.juf = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
@@ -375,6 +380,7 @@ export const roomEngine = {
         if (eff === "rhyme") startRelay(room, "rhyme");          // Rijmen
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
+        if (eff === "give") { room.pendingGive = true; room.givePicks = []; } // give card: active player picks who drinks
         if (eff === "neighbor") {
           // Boer B: the wheel picks TWO present players — one deals out, one drinks.
           // Server-chosen so every client's spin lands on the same people.
@@ -418,6 +424,19 @@ export const roomEngine = {
         if (!isTurn) return { error: "Niet jouw beurt" };
         const name = cleanName(payload && payload.name);
         if (name) { room.kingShotTarget = name; room.pendingKingShot = false; }
+        return { room };
+      }
+      case "give": {
+        // Give card: the active player toggles who drinks (multi-select). Applied
+        // to the per-player drinks tally on "next".
+        if (!isTurn) return { error: "Niet jouw beurt" };
+        if (!room.pendingGive) return { room };
+        const name = cleanName(payload && payload.name);
+        if (name && room.players.some((p) => p.name === name)) {
+          if (!Array.isArray(room.givePicks)) room.givePicks = [];
+          const i = room.givePicks.indexOf(name);
+          if (i >= 0) room.givePicks.splice(i, 1); else room.givePicks.push(name);
+        }
         return { room };
       }
       case "tap": {
@@ -543,8 +562,14 @@ export const roomEngine = {
         if (!isTurn) return { error: "Niet jouw beurt" };
         if (room.pendingBuddy) return { error: "Kies eerst een drinkmaatje" };
         if (room.pendingKingShot) return { error: "Kies eerst wie drinkt" };
+        if (room.pendingGive && (!room.givePicks || room.givePicks.length === 0)) return { error: "Kies eerst wie drinkt" };
         if (room.juf && room.juf.phase !== "done") return { error: "JUF is bezig" };
         if (room.pendingRule) return { error: "Verzin eerst een regel" };
+        // apply the give-picks to the per-player drinks tally before advancing
+        if (room.pendingGive && Array.isArray(room.givePicks)) {
+          for (const nm of room.givePicks) { const p = room.players.find((x) => x.name === nm); if (p) p.drinks = (p.drinks || 0) + 1; }
+        }
+        room.pendingGive = false; room.givePicks = [];
         room.flipped = false; room.card = null;
         room.timer = null;
         room.spinPick = null; room.spinGiver = null;
@@ -560,7 +585,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -590,10 +615,10 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
-        room.players.forEach((p) => { p.cards = 0; p.threes = 0; });
+        room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         return { room };
       }
       default:
