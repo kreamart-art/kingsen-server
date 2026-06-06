@@ -248,7 +248,9 @@ function relayPrompt(mode, lang) {
 function startRelay(room, mode) {
   const n = room.players.length, order = [];
   for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
-  room.juf = { mode, prompt: relayPrompt(mode, room.lang), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
+  // judgeId = the player who DREW the mini-game card (the active turn player). They —
+  // not the host — start nothing manually (auto-start) but DO decide who was wrong.
+  room.juf = { mode, judgeId: (room.players[room.turn] || {}).id || null, prompt: relayPrompt(mode, room.lang), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
 }
 const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
 function jufDeadlineFor(count) { return Date.now() + Math.max(JUF_MIN_MS, JUF_START_MS - JUF_STEP_MS * (count - 1)); }
@@ -484,6 +486,13 @@ export const roomEngine = {
         const J = room.juf;
         if (!J || J.phase !== "ready") return { room };
         J.ready[playerId] = (payload && typeof payload.on === "boolean") ? payload.on : !J.ready[playerId];
+        // Auto-start the instant everyone connected is ready — no host tap needed.
+        const conn = jufConnectedIds(room);
+        if (conn.length >= 1 && conn.every((id) => J.ready[id])) {
+          J.phase = "playing"; J.count = 1; J.turnIndex = -1;
+          jufAdvance(room);                 // lands on the first connected player + arms the timer
+          J.deadline = Date.now() + JUF_START_MS; // first turn gets the full window
+        }
         return { room };
       }
       case "jufstart": {
@@ -515,12 +524,12 @@ export const roomEngine = {
         return { room };
       }
       case "jufjudge": {
-        // Categorie/Rijmen: the app can't judge a spoken word, so the host ends the round
-        // and decides. This enters (or stays in) the "decide" hold (phase "over"): a player
-        // id flags who drinks; an empty id = nobody (yet). The host then taps "continue".
-        if (!isHost) return { error: "Alleen de host" };
+        // Categorie/Rijmen: the app can't judge a spoken word, so the player who DREW the
+        // card ends the round and decides. This enters (or stays in) the "decide" hold
+        // (phase "over"): a player id flags who drinks; an empty id = nobody (yet).
         const J = room.juf;
         if (!J || !(J.mode === "category" || J.mode === "rhyme")) return { room };
+        if (J.judgeId ? playerId !== J.judgeId : !isHost) return { error: "Alleen wie de kaart trok" };
         if (J.phase !== "playing" && J.phase !== "over") return { room };
         if (J.phase !== "over") { J.phase = "over"; J.overSince = Date.now(); }
         const target = room.players.find((p) => p.id === (payload && payload.playerId));
@@ -528,10 +537,10 @@ export const roomEngine = {
         return { room };
       }
       case "jufcontinue": {
-        // Categorie/Rijmen: host leaves the decide hold and goes on to the drawn card.
-        if (!isHost) return { error: "Alleen de host" };
+        // Categorie/Rijmen: the player who drew leaves the decide hold and goes to the card.
         const J = room.juf;
         if (!J || J.phase !== "over") return { room };
+        if (J.judgeId ? playerId !== J.judgeId : !isHost) return { error: "Alleen wie de kaart trok" };
         applyRelayLoser(room);
         J.phase = "done";
         return { room };
