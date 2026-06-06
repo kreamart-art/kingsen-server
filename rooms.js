@@ -157,6 +157,7 @@ function publicState(room) {
     juf: room.juf || null,
     // Tijdbom: expose the fuse window (startedAt..explodeAt) so the client can burn the fuse down visibly.
     bomb: room.bomb ? { order: room.bomb.order, holderId: room.bomb.holderId, startedAt: room.bomb.startedAt, explodeAt: room.bomb.explodeAt, exploded: room.bomb.exploded, loserId: room.bomb.loserId, loserName: room.bomb.loserName } : null,
+    premium: !!room.premium, // whether this room has the premium mini-game pool (host-pays)
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -270,7 +271,8 @@ function startBomb(room) {
 const MG_POOL_BASE = ["juf", "category", "rhyme"];
 const MG_POOL_PREMIUM = ["timebomb"]; // "mostlikely" + others join as they ship
 function startMiniGame(room) {
-  const pool = MG_POOL_BASE.concat(MG_POOL_PREMIUM); // TODO: gate PREMIUM by entitlement when PAYMENTS_LIVE
+  // Host-pays: premium mini-games only join the pool when the room is entitled.
+  const pool = room.premium ? MG_POOL_BASE.concat(MG_POOL_PREMIUM) : MG_POOL_BASE;
   const pick = pool[Math.floor(Math.random() * pool.length)];
   if (pick === "timebomb") startBomb(room);
   else startRelay(room, pick); // "juf" | "category" | "rhyme"
@@ -310,10 +312,11 @@ function applyRelayLoser(room) {
 
 /* ---- the registry / engine API used by the WS layer ---- */
 export const roomEngine = {
-  create({ hostId, name, setCode, setName, lang, alcoholFree, avatar }) {
+  create({ hostId, name, setCode, setName, lang, alcoholFree, avatar, premium }) {
     let code;
     do { code = makeCode(); } while (rooms.has(code));
     const room = newRoom(code, hostId, { setCode, setName, lang, alcoholFree });
+    room.premium = !!premium; // host-pays: the host's entitlement (or trial) unlocks the premium mini-game pool for the whole room
     room.players.push({ id: hostId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0, drinks: 0 });
     rooms.set(code, room);
     return room;

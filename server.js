@@ -252,7 +252,7 @@ const rl = rateLimit({ windowMs: 60 * 1000, max: 600, standardHeaders: true, leg
 app.post("/api/room", rl, (req, res) => {
   const b = req.body || {};
   if (!b.playerId) return res.status(400).json({ error: "Missing playerId" });
-  const room = roomEngine.create({ hostId: b.playerId, name: b.name, setCode: b.setCode, setName: b.setName, lang: b.lang, alcoholFree: b.alcoholFree, avatar: b.avatar });
+  const room = roomEngine.create({ hostId: b.playerId, name: b.name, setCode: b.setCode, setName: b.setName, lang: b.lang, alcoholFree: b.alcoholFree, avatar: b.avatar, premium: b.premium });
   roomEngine.touch(room.code, b.playerId);
   res.json({ code: room.code, hostId: room.hostId, playerId: b.playerId, state: roomEngine.publicState(room) });
 });
