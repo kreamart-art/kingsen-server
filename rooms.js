@@ -274,6 +274,14 @@ function jufLose(room, id, reason, number) {
   room.juf.overSince = Date.now();
   room.juf.lastResult = { drinkerId: id, drinkerName: p ? p.name : "", reason, number };
 }
+// Add the relay's loser to the drinks tally exactly once, when the round ends.
+function applyRelayLoser(room) {
+  const J = room.juf;
+  if (!J || J.tallied) return;
+  J.tallied = true;
+  const id = J.lastResult && J.lastResult.drinkerId;
+  if (id) { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; }
+}
 
 /* ---- the registry / engine API used by the WS layer ---- */
 export const roomEngine = {
@@ -362,6 +370,7 @@ export const roomEngine = {
         const eff = room.effects[next.rank];
         cur.cards += 1;
         if (next.rank === "3") cur.threes += 1;
+        if (eff === "drink") cur.drinks = (cur.drinks || 0) + 1; // self-drink -> drinks tally
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
@@ -398,7 +407,7 @@ export const roomEngine = {
         if (eff === "newrule") { room.pendingRule = true; room.ruleEndsAt = Date.now() + RULE_MS; }
         if (eff === "king") {
           room.kings += 1;
-          if (room.kings >= 4) room.loser = cur.name;
+          if (room.kings >= 4) { room.loser = cur.name; cur.drinks = (cur.drinks || 0) + 1; } // 4th king drinks the glass
           else { room.pendingKingShot = true; room.kingShotTarget = null; } // Koning B: kings 1-3 -> assign a shot
         }
         room.card = next; room.flipped = true;
@@ -423,7 +432,7 @@ export const roomEngine = {
         // Koning B: the drawer assigns the king's shot to a player.
         if (!isTurn) return { error: "Niet jouw beurt" };
         const name = cleanName(payload && payload.name);
-        if (name) { room.kingShotTarget = name; room.pendingKingShot = false; }
+        if (name) { room.kingShotTarget = name; room.pendingKingShot = false; const t = room.players.find((p) => p.name === name); if (t) t.drinks = (t.drinks || 0) + 1; }
         return { room };
       }
       case "give": {
@@ -523,6 +532,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host" };
         const J = room.juf;
         if (!J || J.phase !== "over") return { room };
+        applyRelayLoser(room);
         J.phase = "done";
         return { room };
       }
@@ -712,6 +722,7 @@ export const roomEngine = {
         } else if (J.phase === "over" && now >= J.overSince + (((J.mode === "category" || J.mode === "rhyme")) ? 120000 : JUF_OVER_MS)) {
           // Categorie/Rijmen: the host decides when to continue (this is just a 2-min safety so a
           // forgotten room can't freeze). JUF (counting) still auto-advances after JUF_OVER_MS.
+          applyRelayLoser(room);
           J.phase = "done";
           room.rev = (room.rev || 0) + 1;
           if (!changed.includes(room)) changed.push(room);
