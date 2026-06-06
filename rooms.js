@@ -155,6 +155,8 @@ function publicState(room) {
     chain: room.chain || null,
     thumbRace: room.thumbRace || null,
     juf: room.juf || null,
+    // Tijdbom: expose holder/order/exploded but HIDE explodeAt (keeps the fuse a surprise).
+    bomb: room.bomb ? { order: room.bomb.order, holderId: room.bomb.holderId, startedAt: room.bomb.startedAt, exploded: room.bomb.exploded, loserId: room.bomb.loserId, loserName: room.bomb.loserName } : null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -199,7 +201,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -251,6 +253,27 @@ function startRelay(room, mode) {
   // judgeId = the player who DREW the mini-game card (the active turn player). They —
   // not the host — start nothing manually (auto-start) but DO decide who was wrong.
   room.juf = { mode, judgeId: (room.players[room.turn] || {}).id || null, prompt: relayPrompt(mode, room.lang), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
+}
+// Tijdbom (hot potato): bomb starts with the drawer; players pass it; a HIDDEN random
+// fuse decides when it blows — whoever holds it then drinks. order = connected players
+// in turn order from the drawer.
+const BOMB_MIN_MS = 9000, BOMB_MAX_MS = 24000, BOMB_REVEAL_MS = 4500;
+function startBomb(room) {
+  const n = room.players.length, order = [];
+  for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+  const fuse = BOMB_MIN_MS + Math.floor(Math.random() * (BOMB_MAX_MS - BOMB_MIN_MS));
+  room.bomb = { order, holderId: order[0] || null, startedAt: Date.now(), explodeAt: Date.now() + fuse, exploded: false, explodedAt: 0, loserId: null, loserName: "" };
+}
+// Mini-game POOL: a relay-slot card (counting/category/rhyme rank) now starts a RANDOM
+// mini-game for variety. BASE = the free relays; PREMIUM joins when the room is entitled
+// (ungated for now while PAYMENTS_LIVE is off).
+const MG_POOL_BASE = ["juf", "category", "rhyme"];
+const MG_POOL_PREMIUM = ["timebomb"]; // "mostlikely" + others join as they ship
+function startMiniGame(room) {
+  const pool = MG_POOL_BASE.concat(MG_POOL_PREMIUM); // TODO: gate PREMIUM by entitlement when PAYMENTS_LIVE
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  if (pick === "timebomb") startBomb(room);
+  else startRelay(room, pick); // "juf" | "category" | "rhyme"
 }
 const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
 function jufDeadlineFor(count) { return Date.now() + Math.max(JUF_MIN_MS, JUF_START_MS - JUF_STEP_MS * (count - 1)); }
@@ -360,7 +383,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -376,7 +399,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -386,9 +409,8 @@ export const roomEngine = {
           for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
           room.chain = { order, stopped: [] };
         }
-        if (eff === "counting") startRelay(room, "juf");        // JUF (Sevens)
-        if (eff === "category") startRelay(room, "category");    // Categorie
-        if (eff === "rhyme") startRelay(room, "rhyme");          // Rijmen
+        // relay-slot card -> a RANDOM mini-game from the pool (juf/category/rhyme/timebomb…)
+        if (eff === "counting" || eff === "category" || eff === "rhyme") startMiniGame(room);
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
         if (eff === "give") { room.pendingGive = true; room.givePicks = []; } // give card: active player picks who drinks
@@ -480,6 +502,19 @@ export const roomEngine = {
         if (!room.thumbRace) return { room };
         const me = room.players.find((p) => p.id === playerId);
         if (me && !room.thumbRace.taps.some((t) => t.id === playerId)) room.thumbRace.taps.push({ id: playerId, name: me.name, at: Date.now() });
+        return { room };
+      }
+      case "bombpass": {
+        // Tijdbom: only the current holder may pass; the bomb moves to the next CONNECTED player.
+        const B = room.bomb;
+        if (!B || B.exploded) return { room };
+        if (playerId !== B.holderId) return { room };
+        const ord = B.order, idx = ord.indexOf(B.holderId);
+        for (let step = 1; step <= ord.length; step++) {
+          const cand = ord[(idx + step) % ord.length];
+          const p = room.players.find((x) => x.id === cand);
+          if (p && p.connected) { B.holderId = cand; break; }
+        }
         return { room };
       }
       case "jufready": {
@@ -604,7 +639,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -634,7 +669,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -720,6 +755,32 @@ export const roomEngine = {
         room.thumbRace = null;
         room.rev = (room.rev || 0) + 1;
         if (!changed.includes(room)) changed.push(room);
+      }
+      // Tijdbom: hidden fuse. When it blows, the current holder drinks; show the reveal, then clear.
+      if (room.bomb) {
+        const B = room.bomb;
+        if (!B.exploded) {
+          const h = room.players.find((p) => p.id === B.holderId);
+          if (h && !h.connected) {                 // don't let the bomb sit in a dropped player's hands
+            const ord = B.order;
+            for (let step = 1; step <= ord.length; step++) {
+              const cand = ord[(ord.indexOf(B.holderId) + step) % ord.length];
+              const p = room.players.find((x) => x.id === cand);
+              if (p && p.connected) { B.holderId = cand; break; }
+            }
+            room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+          }
+          if (now >= B.explodeAt) {
+            B.exploded = true; B.explodedAt = now;
+            const loser = room.players.find((p) => p.id === B.holderId);
+            B.loserId = B.holderId; B.loserName = loser ? loser.name : "";
+            if (loser) loser.drinks = (loser.drinks || 0) + 1; // holder at blow-up drinks
+            room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+          }
+        } else if (now >= B.explodedAt + BOMB_REVEAL_MS) {
+          room.bomb = null;                          // reveal done -> clear; active player continues
+          room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+        }
       }
       // JUF: server-authoritative timer/lifecycle.
       if (room.juf) {
