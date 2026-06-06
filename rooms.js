@@ -158,6 +158,8 @@ function publicState(room) {
     // Tijdbom: expose the fuse window (startedAt..explodeAt) so the client can burn the fuse down visibly.
     bomb: room.bomb ? { order: room.bomb.order, holderId: room.bomb.holderId, startedAt: room.bomb.startedAt, explodeAt: room.bomb.explodeAt, exploded: room.bomb.exploded, loserId: room.bomb.loserId, loserName: room.bomb.loserName } : null,
     premium: !!room.premium, // whether this room has the premium mini-game pool (host-pays)
+    // Wie is het meest: hide individual choices while voting (just who voted); reveal the winner(s) on "over".
+    vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -202,7 +204,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -268,13 +270,36 @@ function startBomb(room) {
 // Mini-game POOL: a relay-slot card (counting/category/rhyme rank) now starts a RANDOM
 // mini-game for variety. BASE = the free relays; PREMIUM joins when the room is entitled
 // (ungated for now while PAYMENTS_LIVE is off).
+// Wie is het meest...? — everyone votes a player for a prompt; the most-voted drink(s).
+const VOTE_MS = 22000, VOTE_REVEAL_MS = 5000;
+const VOTE_PROMPTS = {
+  nl: ["valt als eerste in slaap vanavond", "appt een ex na drie drankjes", "trakteert de hele groep", "is morgen te laat op werk", "raakt vannacht z'n telefoon kwijt", "gaat op de tafel dansen", "lacht het hardst om een slechte grap", "gaat als laatste naar huis", "maakt de gekste foto's vanavond", "is het snelst dronken", "spreekt een vreemde aan", "is morgen alles vergeten"],
+  en: ["falls asleep first tonight", "texts an ex after three drinks", "buys the whole group a round", "is late for work tomorrow", "loses their phone tonight", "ends up dancing on the table", "laughs hardest at a bad joke", "leaves last tonight", "takes the wildest photos tonight", "gets drunk the fastest", "talks to a stranger", "forgets everything by tomorrow"],
+};
+function votePrompt(lang) { const a = VOTE_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function startVote(room) {
+  const n = room.players.length, order = [];
+  for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+  room.vote = { prompt: votePrompt(room.lang), order, votes: {}, phase: "voting", result: null, overSince: 0, startedAt: Date.now(), deadline: Date.now() + VOTE_MS };
+}
+function tallyVote(room) {
+  const V = room.vote; if (!V) return;
+  const counts = {};
+  for (const voter of V.order) { const t = V.votes[voter]; if (t) counts[t] = (counts[t] || 0) + 1; }
+  let max = 0; for (const k in counts) if (counts[k] > max) max = counts[k];
+  const winnerIds = max > 0 ? Object.keys(counts).filter((k) => counts[k] === max) : [];
+  winnerIds.forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; }); // most-voted drink
+  V.result = { winners: winnerIds.map((id) => { const p = room.players.find((x) => x.id === id); return { id, name: p ? p.name : "?", votes: max }; }), max };
+  V.phase = "over"; V.overSince = Date.now();
+}
 const MG_POOL_BASE = ["juf", "category", "rhyme"];
-const MG_POOL_PREMIUM = ["timebomb"]; // "mostlikely" + others join as they ship
+const MG_POOL_PREMIUM = ["timebomb", "mostlikely"]; // premium pool — joined to base when the room is entitled
 function startMiniGame(room) {
   // Host-pays: premium mini-games only join the pool when the room is entitled.
   const pool = room.premium ? MG_POOL_BASE.concat(MG_POOL_PREMIUM) : MG_POOL_BASE;
   const pick = pool[Math.floor(Math.random() * pool.length)];
   if (pick === "timebomb") startBomb(room);
+  else if (pick === "mostlikely") startVote(room);
   else startRelay(room, pick); // "juf" | "category" | "rhyme"
 }
 const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
@@ -386,7 +411,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -402,7 +427,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -518,6 +543,18 @@ export const roomEngine = {
           const p = room.players.find((x) => x.id === cand);
           if (p && p.connected) { B.holderId = cand; break; }
         }
+        return { room };
+      }
+      case "votepick": {
+        // Wie is het meest: each participant votes one player; all voted -> tally now.
+        const V = room.vote;
+        if (!V || V.phase !== "voting") return { room };
+        if (!V.order.includes(playerId)) return { room };
+        const target = payload && payload.targetId;
+        if (!V.order.includes(target)) return { room };
+        V.votes[playerId] = target;
+        const connected = V.order.filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected; });
+        if (connected.length > 0 && connected.every((id) => V.votes[id])) tallyVote(room);
         return { room };
       }
       case "jufready": {
@@ -642,7 +679,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -672,7 +709,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -782,6 +819,17 @@ export const roomEngine = {
           }
         } else if (now >= B.explodedAt + BOMB_REVEAL_MS) {
           room.bomb = null;                          // reveal done -> clear; active player continues
+          room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+        }
+      }
+      // Wie is het meest: vote window closes on the deadline (tally what's in); reveal then clear.
+      if (room.vote) {
+        const V = room.vote;
+        if (V.phase === "voting" && V.deadline && now >= V.deadline) {
+          tallyVote(room);
+          room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+        } else if (V.phase === "over" && now >= V.overSince + VOTE_REVEAL_MS) {
+          room.vote = null;
           room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
         }
       }
