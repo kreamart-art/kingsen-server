@@ -80,6 +80,12 @@ db.exec(`
     client_id TEXT NOT NULL,
     PRIMARY KEY (set_id, client_id)
   );
+  CREATE TABLE IF NOT EXISTS entitlements (
+    code       TEXT PRIMARY KEY,
+    decks      TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS idx_sets_uses  ON sets (uses DESC);
   CREATE INDEX IF NOT EXISTS idx_sets_likes ON sets (likes DESC);
   CREATE INDEX IF NOT EXISTS idx_sets_new   ON sets (created_at DESC);
@@ -274,6 +280,36 @@ app.post("/api/room/:code/action", rl, (req, res) => {
   const r = roomEngine.action(req.params.code, b.playerId, b.action, b.payload);
   if (r.error) return res.status(409).json({ error: r.error });
   res.json({ code: r.room.code, hostId: r.room.hostId, state: roomEngine.publicState(r.room) });
+});
+
+// ---- Entitlements (owned premium decks) keyed by a portable RESTORE CODE ----
+// No accounts / no PII: the code IS the credential. Lets purchases survive a
+// reinstall + move across devices. NOTE: there's no real payment yet, so the
+// client writes its (test-)unlocked decks here; once a payment provider exists
+// the GRANT must move server-side (webhook) and the client should only READ.
+function makeRestoreCode() {
+  const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // unambiguous (no O/0/I/1)
+  let c = ""; for (let i = 0; i < 10; i++) c += A[Math.floor(Math.random() * A.length)];
+  return c;
+}
+app.post("/api/entitlements", rl, (req, res) => {
+  const b = req.body || {};
+  const decks = Array.isArray(b.decks) ? b.decks.filter((d) => typeof d === "string").slice(0, 50) : [];
+  let code = (typeof b.code === "string" && /^[A-Z2-9]{10}$/.test(b.code.toUpperCase())) ? b.code.toUpperCase() : null;
+  const now = new Date().toISOString();
+  if (!code) { do { code = makeRestoreCode(); } while (db.prepare("SELECT 1 FROM entitlements WHERE code = ?").get(code)); }
+  if (db.prepare("SELECT 1 FROM entitlements WHERE code = ?").get(code))
+    db.prepare("UPDATE entitlements SET decks = ?, updated_at = ? WHERE code = ?").run(JSON.stringify(decks), now, code);
+  else
+    db.prepare("INSERT INTO entitlements (code, decks, created_at, updated_at) VALUES (?,?,?,?)").run(code, JSON.stringify(decks), now, now);
+  res.json({ code, decks });
+});
+app.get("/api/entitlements/:code", rl, (req, res) => {
+  const code = String(req.params.code || "").toUpperCase();
+  const row = db.prepare("SELECT decks FROM entitlements WHERE code = ?").get(code);
+  if (!row) return res.status(404).json({ error: "Code niet gevonden" });
+  let decks = []; try { decks = JSON.parse(row.decks); } catch { /* */ }
+  res.json({ code, decks });
 });
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
