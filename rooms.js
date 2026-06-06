@@ -160,6 +160,8 @@ function publicState(room) {
     premium: !!room.premium, // whether this room has the premium mini-game pool (host-pays)
     // Wie is het meest: hide individual choices while voting (just who voted); reveal the winner(s) on "over".
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
+    // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
+    green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -204,7 +206,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -292,14 +294,42 @@ function tallyVote(room) {
   V.result = { winners: winnerIds.map((id) => { const p = room.players.find((x) => x.id === id); return { id, name: p ? p.name : "?", votes: max }; }), max };
   V.phase = "over"; V.overSince = Date.now();
 }
+// Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
+// Tapping while red = false start (drink). Slowest reaction (or never reacting) drinks.
+const GREEN_MIN_MS = 2500, GREEN_MAX_MS = 7000, GREEN_TIMEOUT_MS = 6000, GREEN_REVEAL_MS = 4500, GREEN_GRACE_MS = 400;
+function startGreen(room) {
+  const n = room.players.length, order = [];
+  for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
+  const wait = GREEN_MIN_MS + Math.floor(Math.random() * (GREEN_MAX_MS - GREEN_MIN_MS));
+  room.green = { order, phase: "red", greenAt: Date.now() + wait, taps: [], falseStarts: [], startedAt: Date.now(), overSince: 0, result: null };
+}
+function endGreen(room) {
+  const G = room.green; if (!G || G.phase === "over") return;
+  const conn = G.order.filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected; });
+  const losers = new Set();
+  G.falseStarts.forEach((id) => { if (conn.includes(id)) losers.add(id); });   // false starts drink
+  const valid = conn.filter((id) => !G.falseStarts.includes(id));
+  const nonTapped = valid.filter((id) => !G.taps.some((t) => t.id === id));
+  if (nonTapped.length) nonTapped.forEach((id) => losers.add(id));              // never reacted -> drink
+  else if (G.taps.length) { let slow = null, mx = -1; G.taps.forEach((t) => { if (valid.includes(t.id) && t.at > mx) { mx = t.at; slow = t.id; } }); if (slow) losers.add(slow); } // else: slowest drinks
+  let fast = null, mn = Infinity; G.taps.forEach((t) => { if (valid.includes(t.id) && t.at < mn) { mn = t.at; fast = t; } });
+  losers.forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; });
+  G.result = {
+    losers: [...losers].map((id) => { const p = room.players.find((x) => x.id === id); return p ? p.name : "?"; }),
+    falseStarts: G.falseStarts.map((id) => { const p = room.players.find((x) => x.id === id); return p ? p.name : "?"; }),
+    fastest: fast ? { name: fast.name, ms: Math.max(0, fast.at - G.greenAt) } : null,
+  };
+  G.phase = "over"; G.overSince = Date.now();
+}
 const MG_POOL_BASE = ["juf", "category", "rhyme"];
-const MG_POOL_PREMIUM = ["timebomb", "mostlikely"]; // premium pool — joined to base when the room is entitled
+const MG_POOL_PREMIUM = ["timebomb", "mostlikely", "greenlight"]; // premium pool — joined to base when the room is entitled
 function startMiniGame(room) {
   // Host-pays: premium mini-games only join the pool when the room is entitled.
   const pool = room.premium ? MG_POOL_BASE.concat(MG_POOL_PREMIUM) : MG_POOL_BASE;
   const pick = pool[Math.floor(Math.random() * pool.length)];
   if (pick === "timebomb") startBomb(room);
   else if (pick === "mostlikely") startVote(room);
+  else if (pick === "greenlight") startGreen(room);
   else startRelay(room, pick); // "juf" | "category" | "rhyme"
 }
 const JUF_START_MS = 4000, JUF_STEP_MS = 130, JUF_MIN_MS = 1500, JUF_OVER_MS = 4000, JUF_READY_MAX_MS = 90000;
@@ -411,7 +441,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -427,7 +457,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -557,6 +587,22 @@ export const roomEngine = {
         if (connected.length > 0 && connected.every((id) => V.votes[id])) tallyVote(room);
         return { room };
       }
+      case "greentap": {
+        // Wacht op groen: tap on red = false start; on green = reaction tap (last/never drinks).
+        const G = room.green;
+        if (!G || G.phase === "over") return { room };
+        if (!G.order.includes(playerId) || G.falseStarts.includes(playerId)) return { room };
+        const nowt = Date.now();
+        if (G.phase === "red" && nowt >= G.greenAt) G.phase = "green"; // catch up if no tick ran yet
+        if (nowt < G.greenAt - GREEN_GRACE_MS) {
+          if (!G.falseStarts.includes(playerId)) G.falseStarts.push(playerId);
+        } else {
+          if (!G.taps.some((t) => t.id === playerId)) { const p = room.players.find((x) => x.id === playerId); G.taps.push({ id: playerId, name: p ? p.name : "", at: nowt }); }
+          const valid = G.order.filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected && !G.falseStarts.includes(id); });
+          if (valid.length > 0 && valid.every((id) => G.taps.some((t) => t.id === id))) endGreen(room);
+        }
+        return { room };
+      }
       case "jufready": {
         const J = room.juf;
         if (!J || J.phase !== "ready") return { room };
@@ -679,7 +725,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -709,7 +755,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -832,6 +878,13 @@ export const roomEngine = {
           room.vote = null;
           room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
         }
+      }
+      // Wacht op groen: flip red->green at greenAt; end on timeout; clear after the reveal.
+      if (room.green) {
+        const G = room.green;
+        if (G.phase === "red" && now >= G.greenAt) { G.phase = "green"; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
+        else if (G.phase === "green" && now >= G.greenAt + GREEN_TIMEOUT_MS) { endGreen(room); room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
+        else if (G.phase === "over" && now >= G.overSince + GREEN_REVEAL_MS) { room.green = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
       }
       // JUF: server-authoritative timer/lifecycle.
       if (room.juf) {
