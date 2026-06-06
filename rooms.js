@@ -155,8 +155,8 @@ function publicState(room) {
     chain: room.chain || null,
     thumbRace: room.thumbRace || null,
     juf: room.juf || null,
-    // Tijdbom: expose holder/order/exploded but HIDE explodeAt (keeps the fuse a surprise).
-    bomb: room.bomb ? { order: room.bomb.order, holderId: room.bomb.holderId, startedAt: room.bomb.startedAt, exploded: room.bomb.exploded, loserId: room.bomb.loserId, loserName: room.bomb.loserName } : null,
+    // Tijdbom: expose the fuse window (startedAt..explodeAt) so the client can burn the fuse down visibly.
+    bomb: room.bomb ? { order: room.bomb.order, holderId: room.bomb.holderId, startedAt: room.bomb.startedAt, explodeAt: room.bomb.explodeAt, exploded: room.bomb.exploded, loserId: room.bomb.loserId, loserName: room.bomb.loserName } : null,
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
