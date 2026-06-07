@@ -162,6 +162,7 @@ function publicState(room) {
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
     // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
     green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
+    bus: room.bus || null, // Bus rijden: all cards are revealed, nothing hidden, send as-is
     pendingRule: room.pendingRule,
     ruleEndsAt: room.ruleEndsAt || 0,
     turnEndsAt: room.turnEndsAt || 0,
@@ -176,7 +177,10 @@ function publicState(room) {
     // restart (which resets kings to 0). loser is already persisted, so a client
     // that was mid-reconnect when the king landed still sees the end on rejoin —
     // instead of the old transient flag that was only true while the card showed.
-    gameOver: room.kings >= 4,
+    // Held while a bus is active so the 4th-king finale (Vol gas: King = Bus rijden)
+    // plays out before the result screen takes over; the tick clears the bus, then
+    // gameOver flips true on the next push.
+    gameOver: room.kings >= 4 && !room.bus,
   };
 }
 
@@ -206,7 +210,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -320,6 +324,21 @@ function endGreen(room) {
     fastest: fast ? { name: fast.name, ms: Math.max(0, fast.at - G.greenAt) } : null,
   };
   G.phase = "over"; G.overSince = Date.now();
+}
+// Bus rijden (Ride the Bus) — the player who drew it rides solo: 4 phases (red/black ->
+// higher/lower -> inside/outside -> suit). Each WRONG guess = a drink + re-deal (same
+// phase); pass all 4 to get off the bus. Others watch. (Used as KING in the 2nd online set.)
+const BUS_TIMEOUT_MS = 90000, BUS_REVEAL_MS = 5000;
+const BUS_RANK_VAL = { A: 14, K: 13, Q: 12, J: 11, "10": 10, "9": 9, "8": 8, "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2 };
+const BUS_SUITS = ["hearts", "diamonds", "clubs", "spades"];
+function busDeal() {
+  const ranks = Object.keys(BUS_RANK_VAL);
+  return { rank: ranks[Math.floor(Math.random() * ranks.length)], suit: BUS_SUITS[Math.floor(Math.random() * BUS_SUITS.length)] };
+}
+function busColor(c) { return (c.suit === "hearts" || c.suit === "diamonds") ? "red" : "black"; }
+function startBus(room) {
+  const cur = room.players[room.turn];
+  room.bus = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", phase: 1, cards: [], last: null, lastWrong: false, drinks: 0, done: false, startedAt: Date.now(), actAt: Date.now(), overSince: 0 };
 }
 const MG_POOL_BASE = ["juf", "category", "rhyme"];
 const MG_POOL_PREMIUM = ["timebomb", "mostlikely", "greenlight"]; // premium pool — joined to base when the room is entitled
@@ -441,7 +460,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -457,7 +476,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -469,6 +488,12 @@ export const roomEngine = {
         }
         // relay-slot card -> a RANDOM mini-game from the pool (juf/category/rhyme/timebomb…)
         if (eff === "counting" || eff === "category" || eff === "rhyme") startMiniGame(room);
+        if (eff === "wildcard") startMiniGame(room); // Joker in the 2nd online set -> random mini-game
+        if (eff === "busrijden") {                   // King in the 2nd online set -> Ride the Bus
+          startBus(room);
+          room.kings += 1;                           // a King still counts toward the 4-king finish
+          if (room.kings >= 4) room.loser = cur.name; // 4th king = final bus, then game over (held by gameOver until the bus clears)
+        }
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
         if (eff === "give") { room.pendingGive = true; room.givePicks = []; } // give card: active player picks who drinks
@@ -603,6 +628,29 @@ export const roomEngine = {
         }
         return { room };
       }
+      case "busguess": {
+        // Bus rijden: only the driver guesses; wrong = drink + re-deal (same phase), right = advance.
+        const Bs = room.bus;
+        if (!Bs || Bs.done) return { room };
+        if (playerId !== Bs.drawerId) return { error: "Alleen wie de bus rijdt" };
+        const choice = payload && payload.choice;
+        const card = busDeal(); Bs.actAt = Date.now();
+        let correct = false;
+        if (Bs.phase === 1) correct = (choice === busColor(card));
+        else if (Bs.phase === 2 && Bs.cards[0]) { const v = BUS_RANK_VAL[card.rank], p = BUS_RANK_VAL[Bs.cards[0].rank]; correct = choice === "higher" ? v > p : choice === "lower" ? v < p : false; }
+        else if (Bs.phase === 3 && Bs.cards[1]) { const v = BUS_RANK_VAL[card.rank], a = BUS_RANK_VAL[Bs.cards[0].rank], b = BUS_RANK_VAL[Bs.cards[1].rank], lo = Math.min(a, b), hi = Math.max(a, b); correct = choice === "inside" ? (v > lo && v < hi) : choice === "outside" ? (v < lo || v > hi) : false; }
+        else if (Bs.phase === 4) correct = (choice === card.suit);
+        Bs.last = card; Bs.lastWrong = !correct;
+        if (correct) {
+          if (Bs.phase <= 3) Bs.cards.push(card);
+          Bs.phase += 1;
+          if (Bs.phase > 4) { Bs.done = true; Bs.overSince = Date.now(); }
+        } else {
+          Bs.drinks = (Bs.drinks || 0) + 1;
+          const p = room.players.find((x) => x.id === Bs.drawerId); if (p) p.drinks = (p.drinks || 0) + 1;
+        }
+        return { room };
+      }
       case "jufready": {
         const J = room.juf;
         if (!J || J.phase !== "ready") return { room };
@@ -725,7 +773,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -755,7 +803,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -885,6 +933,12 @@ export const roomEngine = {
         if (G.phase === "red" && now >= G.greenAt) { G.phase = "green"; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
         else if (G.phase === "green" && now >= G.greenAt + GREEN_TIMEOUT_MS) { endGreen(room); room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
         else if (G.phase === "over" && now >= G.overSince + GREEN_REVEAL_MS) { room.green = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
+      }
+      // Bus rijden: clear after the reveal; safety end if the driver goes AFK.
+      if (room.bus) {
+        const Bs = room.bus;
+        if (Bs.done) { if (now >= Bs.overSince + BUS_REVEAL_MS) { room.bus = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); } }
+        else if (now >= Bs.actAt + BUS_TIMEOUT_MS) { Bs.done = true; Bs.overSince = now; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
       }
       // JUF: server-authoritative timer/lifecycle.
       if (room.juf) {
