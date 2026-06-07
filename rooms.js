@@ -25,9 +25,10 @@ const DEFAULT_EFFECT = {
   J: "neighbor", Q: "questionmaster", K: "king",
 };
 
-function makeDeck() {
+function makeDeck(jokers) {
   const deck = [];
   for (const s of SUITS) for (const rank of RANKS) deck.push({ rank, sym: s.sym, color: s.color });
+  for (let n = 0; n < (jokers || 0); n++) deck.push({ rank: "JOKER", sym: "★", color: "joker" }); // extra Wildcard cards (Vol gas)
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     const t = deck[i]; deck[i] = deck[j]; deck[j] = t;
@@ -386,11 +387,13 @@ function applyRelayLoser(room) {
 
 /* ---- the registry / engine API used by the WS layer ---- */
 export const roomEngine = {
-  create({ hostId, name, setCode, setName, lang, alcoholFree, avatar, premium }) {
+  create({ hostId, name, setCode, setName, lang, alcoholFree, avatar, premium, jokers }) {
     let code;
     do { code = makeCode(); } while (rooms.has(code));
     const room = newRoom(code, hostId, { setCode, setName, lang, alcoholFree });
     room.premium = !!premium; // host-pays: the host's entitlement (or trial) unlocks the premium mini-game pool for the whole room
+    room.jokers = Math.max(0, Math.min(4, Number(jokers) || 0)); // extra Wildcard cards in the deck (Vol gas)
+    if (room.jokers > 0) room.effects.JOKER = "wildcard";        // the Joker rank isn't in the setCode, so wire its effect here
     room.players.push({ id: hostId, name: cleanName(name), avatar: cleanAvatar(avatar), connected: true, cards: 0, threes: 0, drinks: 0 });
     rooms.set(code, room);
     return room;
@@ -454,7 +457,7 @@ export const roomEngine = {
         // every connected guest must have read the rules + tapped ready (the host's start click = host ready)
         if (room.players.some((p) => p.connected && p.id !== room.hostId && !room.gateReady[p.id])) return { error: "Nog niet iedereen is klaar" };
         room.gate = false; room.gateReady = {};
-        room.started = true; room.deck = makeDeck(); room.turn = 0;
+        room.started = true; room.deck = makeDeck(room.jokers); room.turn = 0;
         room.card = null; room.flipped = false; room.kings = 0;
         room.thumbMaster = null; room.questionMaster = null; room.pairs = [];
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
@@ -489,10 +492,10 @@ export const roomEngine = {
         // relay-slot card -> a RANDOM mini-game from the pool (juf/category/rhyme/timebomb…)
         if (eff === "counting" || eff === "category" || eff === "rhyme") startMiniGame(room);
         if (eff === "wildcard") startMiniGame(room); // Joker in the 2nd online set -> random mini-game
-        if (eff === "busrijden") {                   // King in the 2nd online set -> Ride the Bus
-          startBus(room);
-          room.kings += 1;                           // a King still counts toward the 4-king finish
-          if (room.kings >= 4) room.loser = cur.name; // 4th king = final bus, then game over (held by gameOver until the bus clears)
+        if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
+          room.kings += 1;
+          if (room.kings >= 4) { startBus(room); room.loser = cur.name; } // 4th king = the bus finale, then game over (held until the bus clears)
+          else { room.pendingKingShot = true; room.kingShotTarget = null; } // kings 1-3: drawer hands out a shot
         }
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
