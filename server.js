@@ -24,6 +24,7 @@ import { WebSocketServer } from "ws";
 import { createHmac } from "node:crypto";
 import { openDatabase } from "./db.js";
 import { roomEngine } from "./rooms.js";
+import webpush from "web-push";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -86,10 +87,24 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS push_subs (
+    endpoint   TEXT PRIMARY KEY,
+    sub        TEXT NOT NULL,
+    lang       TEXT,
+    created_at TEXT NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS idx_sets_uses  ON sets (uses DESC);
   CREATE INDEX IF NOT EXISTS idx_sets_likes ON sets (likes DESC);
   CREATE INDEX IF NOT EXISTS idx_sets_new   ON sets (created_at DESC);
 `);
+
+// ---- Web Push notifications (installed-app announcements) ----
+// Public key is safe to ship; private key prefers an env var, with a fallback so
+// it works out-of-the-box (the repo is private). Send is gated by PUSH_ADMIN_KEY.
+const VAPID_PUBLIC = "BIiUXfcLzr6-j5Hna6A2cI-o7MqI1Q9oIAlKwRk2GphnrphSdDCTcKv_RZK4tdZV5D7phy_w34z-SEgXMIOxe8U";
+const VAPID_PRIVATE = process.env.KINGSEN_VAPID_PRIVATE || "gGvc8U71QNNccHbVglhSZP5VviWib7rp9IgdZ4FJJk4";
+const PUSH_ADMIN_KEY = process.env.KINGSEN_PUSH_ADMIN || "KINGSADMIN";
+try { webpush.setVapidDetails("mailto:info@artnomad.nl", VAPID_PUBLIC, VAPID_PRIVATE); } catch (e) { console.warn("VAPID setup failed:", e.message); }
 
 // Auto-seed the example sets on first boot (empty table), unless disabled.
 if (process.env.KINGSEN_NO_SEED !== "1") {
@@ -310,6 +325,38 @@ app.get("/api/entitlements/:code", rl, (req, res) => {
   if (!row) return res.status(404).json({ error: "Code niet gevonden" });
   let decks = []; try { decks = JSON.parse(row.decks); } catch { /* */ }
   res.json({ code, decks });
+});
+
+/* ---- Web Push: key / subscribe / unsubscribe / send ---- */
+app.get("/api/push/key", (_req, res) => res.json({ publicKey: VAPID_PUBLIC }));
+app.post("/api/push/subscribe", rl, (req, res) => {
+  const b = req.body || {};
+  const sub = b.sub;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: "Bad subscription" });
+  const now = new Date().toISOString();
+  try {
+    db.prepare("INSERT INTO push_subs (endpoint, sub, lang, created_at) VALUES (?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET sub = excluded.sub, lang = excluded.lang")
+      .run(sub.endpoint, JSON.stringify(sub), typeof b.lang === "string" ? b.lang.slice(0, 5) : null, now);
+  } catch (e) { return res.status(500).json({ error: "store failed" }); }
+  res.json({ ok: true });
+});
+app.post("/api/push/unsubscribe", rl, (req, res) => {
+  const ep = (req.body && req.body.endpoint) || "";
+  if (ep) { try { db.prepare("DELETE FROM push_subs WHERE endpoint = ?").run(ep); } catch { /* */ } }
+  res.json({ ok: true });
+});
+app.post("/api/push/send", rl, async (req, res) => {
+  const b = req.body || {};
+  if (b.key !== PUSH_ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
+  const payload = JSON.stringify({ title: String(b.title || "Kings").slice(0, 80), body: String(b.body || "").slice(0, 200), url: String(b.url || "/").slice(0, 200) });
+  const rows = db.prepare("SELECT endpoint, sub FROM push_subs").all();
+  let sent = 0, removed = 0;
+  await Promise.all(rows.map(async (r) => {
+    let sub; try { sub = JSON.parse(r.sub); } catch { return; }
+    try { await webpush.sendNotification(sub, payload); sent++; }
+    catch (e) { if (e && (e.statusCode === 410 || e.statusCode === 404)) { try { db.prepare("DELETE FROM push_subs WHERE endpoint = ?").run(r.endpoint); removed++; } catch { /* */ } } }
+  }));
+  res.json({ ok: true, sent, removed, total: rows.length });
 });
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
