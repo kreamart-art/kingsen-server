@@ -489,17 +489,23 @@ export const roomEngine = {
           for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
           room.chain = { order, stopped: [] };
         }
-        // relay-slot card -> a RANDOM mini-game from the pool (juf/category/rhyme/timebomb…)
-        if (eff === "counting" || eff === "category" || eff === "rhyme") startMiniGame(room);
-        // cards FIXED to one specific mini-game (Vol gas uses these so the card title matches the game)
+        // Each named card plays its OWN mini-game (so the card title matches the game).
+        if (eff === "counting") startRelay(room, "juf");
+        if (eff === "category") startRelay(room, "category");
+        if (eff === "rhyme") startRelay(room, "rhyme");
         if (eff === "timebomb") startBomb(room);
         if (eff === "mostlikely") startVote(room);
         if (eff === "greenlight") startGreen(room);
-        if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws ALL mini-games (random)
+        if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws a RANDOM mini-game from the full pool
         if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
           room.kings += 1;
           if (room.kings >= 4) { startBus(room); room.loser = cur.name; } // 4th king = the bus finale, then game over (held until the bus clears)
           else { room.pendingKingShot = true; room.kingShotTarget = null; } // kings 1-3: drawer hands out a shot
+        }
+        if (eff === "busall") {                       // Hardcore King: EVERY king rides the bus; the 4th ends the game
+          room.kings += 1;
+          startBus(room);
+          if (room.kings >= 4) room.loser = cur.name;
         }
         if (eff === "questionmaster") room.questionMaster = cur.name;
         if (eff === "buddy") room.pendingBuddy = true;
