@@ -132,7 +132,7 @@ function publicState(room) {
     setName: room.setName,
     lang: room.lang,
     alcoholFree: room.alcoholFree,
-    players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar || "", connected: p.connected, cards: p.cards, threes: p.threes, drinks: p.drinks || 0 })),
+    players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar || "", connected: p.connected, cards: p.cards, threes: p.threes, drinks: p.drinks || 0, bot: !!p.bot })),
     started: room.started,
     gate: !!room.gate,
     gateReady: room.gateReady || {},
@@ -385,6 +385,67 @@ function applyRelayLoser(room) {
   if (id) { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; }
 }
 
+/* ---- Test bot (admin) — lets the host play online solo. Driven by the tick:
+   it readies the gate, draws on its turn, resolves mandatory prompts, advances,
+   and participates in every mini-game. Acts at most once per BOT_DELAY_MS so it
+   feels human. Each action goes through roomEngine.action() to reuse all logic. */
+const BOT_DELAY_MS = 1300;
+function driveBots(room, now) {
+  if (!room.started || room.closed) return false;
+  if (!room.players.some((p) => p.bot && p.connected)) return false;
+  if (now - (room.botAt || 0) < BOT_DELAY_MS) return false;
+  const code = room.code;
+  const bots = room.players.filter((p) => p.bot && p.connected);
+  const isBot = (id) => bots.some((b) => b.id === id);
+  const act = (botId, type, payload) => { roomEngine.action(code, botId, type, payload); room.botAt = now; return true; };
+  const pickOther = (botId) => { const o = room.players.filter((p) => p.connected && p.id !== botId); return o[Math.floor(Math.random() * o.length)]; };
+
+  // ---- participate in any active mini-game (regardless of whose turn it is) ----
+  if (room.juf) {
+    const J = room.juf;
+    if (J.phase === "ready") { const b = bots.find((x) => J.order.includes(x.id) && !J.ready[x.id]); if (b) return act(b.id, "jufready", { on: true }); }
+    else if (J.phase === "playing") {
+      const curId = J.order[J.turnIndex];
+      if (isBot(curId)) return act(curId, "jufanswer", { answer: jufIsJuf(J.count) ? "juf" : "number" });
+      if ((J.mode === "category" || J.mode === "rhyme") && isBot(J.judgeId) && J.count > J.order.length) return act(J.judgeId, "jufjudge", { playerId: "" });
+    } else if (J.phase === "over" && isBot(J.judgeId)) return act(J.judgeId, "jufcontinue");
+  }
+  if (room.bomb && !room.bomb.exploded && isBot(room.bomb.holderId)) return act(room.bomb.holderId, "bombpass");
+  if (room.vote && room.vote.phase === "voting") {
+    const b = bots.find((x) => room.vote.order.includes(x.id) && !room.vote.votes[x.id]);
+    if (b) { const ts = room.vote.order.filter((id) => id !== b.id); return act(b.id, "votepick", { targetId: ts[Math.floor(Math.random() * ts.length)] || b.id }); }
+  }
+  if (room.green && room.green.phase === "green") {
+    const b = bots.find((x) => room.green.order.includes(x.id) && !room.green.falseStarts.includes(x.id) && !room.green.taps.some((t) => t.id === x.id));
+    if (b) return act(b.id, "greentap");
+  }
+  if (room.bus && !room.bus.done && isBot(room.bus.drawerId)) {
+    const ph = room.bus.phase;
+    const choice = ph === 1 ? (Math.random() < 0.5 ? "red" : "black") : ph === 2 ? (Math.random() < 0.5 ? "higher" : "lower") : ph === 3 ? (Math.random() < 0.5 ? "inside" : "outside") : BUS_SUITS[Math.floor(Math.random() * 4)];
+    return act(room.bus.drawerId, "busguess", { choice });
+  }
+  if (room.race && now >= room.race.openAt) { const b = bots.find((x) => !room.race.taps.some((t) => t.id === x.id)); if (b) return act(b.id, "tap"); }
+  if (room.chain) { const nx = room.chain.order[room.chain.stopped.length]; if (isBot(nx)) return act(nx, "waterstop"); }
+  if (room.thumbRace) { const b = bots.find((x) => !room.thumbRace.taps.some((t) => t.id === x.id)); if (b) return act(b.id, "thumbtap"); }
+
+  // ---- the bot's own turn (only while the game is still live) ----
+  if (room.kings >= 4) return false;
+  const cur = room.players[room.turn];
+  if (cur && cur.bot && cur.connected) {
+    if (!room.flipped) return act(cur.id, "draw");
+    if (room.pendingRule) return act(cur.id, "rule", { text: room.lang === "en" ? "Bot rule: cheers! 🍻" : "Bot-regel: proost! 🍻" });
+    if (room.pendingKingShot) { const t = pickOther(cur.id); if (t) return act(cur.id, "kingshot", { name: t.name }); }
+    if (room.pendingBuddy) { const t = pickOther(cur.id); if (t) return act(cur.id, "buddy", { name: t.name }); }
+    if (room.pendingGive) { if (!room.givePicks || !room.givePicks.length) { const t = pickOther(cur.id); if (t) return act(cur.id, "give", { name: t.name }); } else return act(cur.id, "next"); }
+    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace
+      || (room.juf && room.juf.phase !== "done")
+      || (room.chain && room.chain.stopped.length < room.chain.order.length)
+      || (room.race && now < room.race.openAt + 4000);
+    if (!blockNext) return act(cur.id, "next");
+  }
+  return false;
+}
+
 /* ---- the registry / engine API used by the WS layer ---- */
 export const roomEngine = {
   create({ hostId, name, setCode, setName, lang, alcoholFree, avatar, premium, jokers }) {
@@ -435,6 +496,18 @@ export const roomEngine = {
         if (room.started) return { room };
         if (room.players.length < 2) return { error: "Minimaal 2 spelers" };
         room.gate = true; room.gateReady = {};
+        room.players.forEach((p) => { if (p.bot) room.gateReady[p.id] = true; }); // test bots are always ready
+        return { room };
+      }
+      case "addbot": {
+        // Admin test bot: lets the host play online solo. The tick (driveBots) makes it act.
+        if (!isHost) return { error: "Alleen de host" };
+        if (room.started) return { room };
+        const botCount = room.players.filter((p) => p.bot).length;
+        if (room.players.length >= 8 || botCount >= 3) return { room };
+        const id = "bot_" + Math.random().toString(36).slice(2, 9);
+        room.players.push({ id, name: "Bot " + (botCount + 1), avatar: "", connected: true, cards: 0, threes: 0, drinks: 0, bot: true });
+        if (room.gate) room.gateReady[id] = true;
         return { room };
       }
       case "closegate": {
@@ -455,7 +528,7 @@ export const roomEngine = {
         if (room.players.length < 2) return { error: "Minimaal 2 spelers" };
         if (!room.gate) return { error: "Open eerst de regels" };
         // every connected guest must have read the rules + tapped ready (the host's start click = host ready)
-        if (room.players.some((p) => p.connected && p.id !== room.hostId && !room.gateReady[p.id])) return { error: "Nog niet iedereen is klaar" };
+        if (room.players.some((p) => p.connected && p.id !== room.hostId && !p.bot && !room.gateReady[p.id])) return { error: "Nog niet iedereen is klaar" };
         room.gate = false; room.gateReady = {};
         room.started = true; room.deck = makeDeck(room.jokers); room.turn = 0;
         room.card = null; room.flipped = false; room.kings = 0;
@@ -973,6 +1046,8 @@ export const roomEngine = {
           if (!changed.includes(room)) changed.push(room);
         }
       }
+      // Test bots take their actions based on the freshest state.
+      if (driveBots(room, now)) { if (!changed.includes(room)) changed.push(room); }
     }
     return changed;
   },
