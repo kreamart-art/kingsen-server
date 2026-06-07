@@ -161,6 +161,7 @@ function publicState(room) {
     premium: !!room.premium, // whether this room has the premium mini-game pool (host-pays)
     // Wie is het meest: hide individual choices while voting (just who voted); reveal the winner(s) on "over".
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
+    couple: room.couple ? { drawerId: room.couple.drawerId, drawerName: room.couple.drawerName, partnerId: room.couple.partnerId, partnerName: room.couple.partnerName, prompt: room.couple.prompt, phase: room.couple.phase, aAnswer: room.couple.phase === "over" ? room.couple.aAnswer : null, bGuess: room.couple.phase === "over" ? room.couple.bGuess : null, match: room.couple.match } : null,
     // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
     green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
     bus: room.bus || null, // Bus rijden: all cards are revealed, nothing hidden, send as-is
@@ -211,7 +212,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -298,6 +299,18 @@ function tallyVote(room) {
   winnerIds.forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; }); // most-voted drink
   V.result = { winners: winnerIds.map((id) => { const p = room.players.find((x) => x.id === id); return { id, name: p ? p.name : "?", votes: max }; }), max };
   V.phase = "over"; V.overSince = Date.now();
+}
+// Koppel-quiz — "guess your partner": the drawer picks a partner, secretly answers
+// "who of you [prompt]?", the partner guesses that answer; a mismatch = both drink.
+const COUPLE_REVEAL_MS = 6000;
+const COUPLE_PROMPTS = {
+  nl: ["is romantischer", "is vaker jaloers", "geeft meer geld uit", "is vaker te laat", "kan beter koken", "is de baas in de relatie", "appt als eerste terug", "pakt vaker de afstandsbediening", "is sneller boos", "onthoudt verjaardagen beter", "flirt meer", "snurkt het hardst", "wint vaker een ruzie"],
+  en: ["is more romantic", "gets jealous more", "spends more money", "is late more often", "is the better cook", "wears the pants", "texts back first", "hogs the remote", "gets angry faster", "remembers birthdays better", "flirts more", "snores loudest", "wins more arguments"],
+};
+function couplePrompt(lang) { const a = COUPLE_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function startCouple(room) {
+  const cur = room.players[room.turn];
+  room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang), phase: "partner", aAnswer: null, bGuess: null, match: false, overSince: 0 };
 }
 // Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
 // Tapping while red = false start (drink). Slowest reaction (or never reacting) drinks.
@@ -427,6 +440,12 @@ function driveBots(room, now) {
   if (room.race && now >= room.race.openAt) { const b = bots.find((x) => !room.race.taps.some((t) => t.id === x.id)); if (b) return act(b.id, "tap"); }
   if (room.chain) { const nx = room.chain.order[room.chain.stopped.length]; if (isBot(nx)) return act(nx, "waterstop"); }
   if (room.thumbRace) { const b = bots.find((x) => !room.thumbRace.taps.some((t) => t.id === x.id)); if (b) return act(b.id, "thumbtap"); }
+  if (room.couple) {
+    const C = room.couple;
+    if (C.phase === "partner" && isBot(C.drawerId)) { const o = room.players.filter((p) => p.connected && p.id !== C.drawerId); const t = o[Math.floor(Math.random() * o.length)]; if (t) return act(C.drawerId, "couplepartner", { targetId: t.id }); }
+    else if (C.phase === "answer" && isBot(C.drawerId)) return act(C.drawerId, "coupleanswer", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
+    else if (C.phase === "guess" && isBot(C.partnerId)) return act(C.partnerId, "coupleguess", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
+  }
 
   // ---- the bot's own turn (only while the game is still live) ----
   if (room.kings >= 4) return false;
@@ -437,7 +456,7 @@ function driveBots(room, now) {
     if (room.pendingKingShot) { const t = pickOther(cur.id); if (t) return act(cur.id, "kingshot", { name: t.name }); }
     if (room.pendingBuddy) { const t = pickOther(cur.id); if (t) return act(cur.id, "buddy", { name: t.name }); }
     if (room.pendingGive) { if (!room.givePicks || !room.givePicks.length) { const t = pickOther(cur.id); if (t) return act(cur.id, "give", { name: t.name }); } else return act(cur.id, "next"); }
-    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace
+    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace || room.couple
       || (room.juf && room.juf.phase !== "done")
       || (room.chain && room.chain.stopped.length < room.chain.order.length)
       || (room.race && now < room.race.openAt + 4000);
@@ -536,7 +555,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -552,7 +571,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -569,6 +588,7 @@ export const roomEngine = {
         if (eff === "timebomb") startBomb(room);
         if (eff === "mostlikely") startVote(room);
         if (eff === "greenlight") startGreen(room);
+        if (eff === "couplequiz") startCouple(room);
         if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws a RANDOM mini-game from the full pool
         if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
           room.kings += 1;
@@ -696,6 +716,36 @@ export const roomEngine = {
         V.votes[playerId] = target;
         const connected = V.order.filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected; });
         if (connected.length > 0 && connected.every((id) => V.votes[id])) tallyVote(room);
+        return { room };
+      }
+      case "couplepartner": {
+        // Koppel-quiz: the drawer picks their partner for this round.
+        const C = room.couple;
+        if (!C || C.phase !== "partner") return { room };
+        if (playerId !== C.drawerId) return { error: "Alleen wie de kaart trok" };
+        const t = room.players.find((p) => p.id === (payload && payload.targetId));
+        if (t && t.id !== C.drawerId) { C.partnerId = t.id; C.partnerName = t.name; C.phase = "answer"; }
+        return { room };
+      }
+      case "coupleanswer": {
+        // Koppel-quiz: the drawer secretly answers "who of you [prompt]?" (hidden until reveal).
+        const C = room.couple;
+        if (!C || C.phase !== "answer") return { room };
+        if (playerId !== C.drawerId) return { error: "Alleen wie de kaart trok" };
+        const pick = payload && payload.pick;
+        if (pick === C.drawerId || pick === C.partnerId) { C.aAnswer = pick; C.phase = "guess"; }
+        return { room };
+      }
+      case "coupleguess": {
+        // Koppel-quiz: the partner guesses the drawer's answer; mismatch = both drink.
+        const C = room.couple;
+        if (!C || C.phase !== "guess") return { room };
+        if (playerId !== C.partnerId) return { error: "Alleen de partner raadt" };
+        const pick = payload && payload.pick;
+        if (pick === C.drawerId || pick === C.partnerId) {
+          C.bGuess = pick; C.match = (pick === C.aAnswer); C.phase = "over"; C.overSince = Date.now();
+          if (!C.match) [C.drawerId, C.partnerId].forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; });
+        }
         return { room };
       }
       case "greentap": {
@@ -859,7 +909,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -889,7 +939,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -1019,6 +1069,10 @@ export const roomEngine = {
         if (G.phase === "red" && now >= G.greenAt) { G.phase = "green"; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
         else if (G.phase === "green" && now >= G.greenAt + GREEN_TIMEOUT_MS) { endGreen(room); room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
         else if (G.phase === "over" && now >= G.overSince + GREEN_REVEAL_MS) { room.green = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
+      }
+      // Koppel-quiz: clear after the reveal window.
+      if (room.couple && room.couple.phase === "over" && now >= room.couple.overSince + COUPLE_REVEAL_MS) {
+        room.couple = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
       }
       // Bus rijden: clear after the reveal; safety end if the driver goes AFK.
       if (room.bus) {
