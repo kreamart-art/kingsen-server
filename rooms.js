@@ -491,7 +491,11 @@ export const roomEngine = {
         }
         // relay-slot card -> a RANDOM mini-game from the pool (juf/category/rhyme/timebomb…)
         if (eff === "counting" || eff === "category" || eff === "rhyme") startMiniGame(room);
-        if (eff === "wildcard") startMiniGame(room); // Joker in the 2nd online set -> random mini-game
+        // cards FIXED to one specific mini-game (Vol gas uses these so the card title matches the game)
+        if (eff === "timebomb") startBomb(room);
+        if (eff === "mostlikely") startVote(room);
+        if (eff === "greenlight") startGreen(room);
+        if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws ALL mini-games (random)
         if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
           room.kings += 1;
           if (room.kings >= 4) { startBus(room); room.loser = cur.name; } // 4th king = the bus finale, then game over (held until the bus clears)
