@@ -162,6 +162,7 @@ function publicState(room) {
     // Wie is het meest: hide individual choices while voting (just who voted); reveal the winner(s) on "over".
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
     couple: room.couple ? { drawerId: room.couple.drawerId, drawerName: room.couple.drawerName, partnerId: room.couple.partnerId, partnerName: room.couple.partnerName, prompt: room.couple.prompt, phase: room.couple.phase, aAnswer: room.couple.phase === "over" ? room.couple.aAnswer : null, bGuess: room.couple.phase === "over" ? room.couple.bGuess : null, match: room.couple.match } : null,
+    spectrum: room.spectrum ? { drawerId: room.spectrum.drawerId, drawerName: room.spectrum.drawerName, partnerId: room.spectrum.partnerId, partnerName: room.spectrum.partnerName, round: room.spectrum.round, setterId: room.spectrum.setterId, setterName: room.spectrum.setterName, raderId: room.spectrum.raderId, raderName: room.spectrum.raderName, prompt: room.spectrum.prompt, phase: room.spectrum.phase, setVal: room.spectrum.phase === "reveal" ? room.spectrum.setVal : null, guessVal: room.spectrum.phase === "reveal" ? room.spectrum.guessVal : null, diff: room.spectrum.diff, drinks: room.spectrum.drinks, r1: room.spectrum.r1 } : null,
     // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
     green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
     bus: room.bus || null, // Bus rijden: all cards are revealed, nothing hidden, send as-is
@@ -212,7 +213,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -311,6 +312,60 @@ function couplePrompt(lang) { const a = COUPLE_PROMPTS[lang === "en" ? "en" : "n
 function startCouple(room) {
   const cur = room.players[room.turn];
   room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang), phase: "partner", aAnswer: null, bGuess: null, match: false, overSince: 0 };
+}
+// Spectrum — couples scale game. The setter secretly places a marker on a 0-100
+// concept; the rader guesses; the distance = drinks for the rader. Two rounds with
+// the roles swapped. Setter/guess values are hidden until the reveal. Pack-ready list.
+const SPECTRUM_REVEAL_MS = 6500;
+const SPECTRUM_PROMPTS = {
+  nl: [
+    { q: "Hoe romantisch ben jij?", lo: "IJskoud", hi: "Super romantisch" },
+    { q: "Hoe jaloers ben jij?", lo: "Totaal niet", hi: "Mega jaloers" },
+    { q: "Hoe goed kun jij koken?", lo: "Brandt water aan", hi: "Topchef" },
+    { q: "Hoe netjes ben jij?", lo: "Puinhoop", hi: "Pietje precies" },
+    { q: "Hoe avontuurlijk ben jij?", lo: "Bankhanger", hi: "Waaghals" },
+    { q: "Hoe snel ben jij verliefd?", lo: "Steen", hi: "Meteen smoor" },
+    { q: "Hoe vaak check jij je telefoon?", lo: "Bijna nooit", hi: "Non-stop" },
+    { q: "Hoe goed kun jij dansen?", lo: "Twee linkervoeten", hi: "Dansvloer-koning(in)" },
+    { q: "Hoe spontaan ben jij?", lo: "Alles gepland", hi: "Volledig spontaan" },
+    { q: "Hoe competitief ben jij?", lo: "Boeit niet", hi: "Moet winnen" },
+    { q: "Hoe goed kun jij liegen?", lo: "Doorzichtig", hi: "Pokerface" },
+    { q: "Ochtend- of avondmens?", lo: "Ochtendmens", hi: "Nachtbraker" },
+    { q: "Hoe gek ben jij op cadeaus geven?", lo: "Vergeet 't", hi: "Sinterklaas" },
+    { q: "Hoe flirterig ben jij?", lo: "Houten Klaas", hi: "Charmeur" },
+    { q: "Hoe koppig ben jij?", lo: "Meegaand", hi: "Ezel" },
+  ],
+  en: [
+    { q: "How romantic are you?", lo: "Ice cold", hi: "Super romantic" },
+    { q: "How jealous are you?", lo: "Not at all", hi: "Very jealous" },
+    { q: "How good a cook are you?", lo: "Burns water", hi: "Top chef" },
+    { q: "How tidy are you?", lo: "Total mess", hi: "Neat freak" },
+    { q: "How adventurous are you?", lo: "Couch potato", hi: "Daredevil" },
+    { q: "How fast do you fall in love?", lo: "Stone", hi: "Instantly smitten" },
+    { q: "How often do you check your phone?", lo: "Almost never", hi: "Non-stop" },
+    { q: "How well can you dance?", lo: "Two left feet", hi: "Dance floor royalty" },
+    { q: "How spontaneous are you?", lo: "All planned", hi: "Fully spontaneous" },
+    { q: "How competitive are you?", lo: "Don't care", hi: "Must win" },
+    { q: "How good a liar are you?", lo: "See-through", hi: "Poker face" },
+    { q: "Morning or night person?", lo: "Morning person", hi: "Night owl" },
+    { q: "How much do you love giving gifts?", lo: "Forgets", hi: "Santa Claus" },
+    { q: "How flirty are you?", lo: "Wooden", hi: "Charmer" },
+    { q: "How stubborn are you?", lo: "Easygoing", hi: "Mule" },
+  ],
+};
+function spectrumPrompt(lang) { const a = SPECTRUM_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function spectrumDrinks(diff) { return diff <= 5 ? 0 : diff <= 15 ? 1 : diff <= 30 ? 2 : diff <= 50 ? 3 : 4; }
+function clampPct(v) { return Math.max(0, Math.min(100, Math.round(Number(v) || 0))); }
+function startSpectrum(room) {
+  const cur = room.players[room.turn];
+  room.spectrum = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", round: 1, setterId: null, setterName: "", raderId: null, raderName: "", prompt: spectrumPrompt(room.lang), phase: "partner", setVal: null, guessVal: null, diff: 0, drinks: 0, r1: null, overSince: 0 };
+}
+function spectrumNextRound(room) {
+  const S = room.spectrum; if (!S) return;
+  S.r1 = { prompt: S.prompt, setVal: S.setVal, guessVal: S.guessVal, diff: S.diff, drinks: S.drinks, setterName: S.setterName, raderName: S.raderName };
+  S.round = 2;
+  S.setterId = S.partnerId; S.setterName = S.partnerName; S.raderId = S.drawerId; S.raderName = S.drawerName;
+  S.prompt = spectrumPrompt(room.lang); S.phase = "set"; S.setVal = null; S.guessVal = null; S.diff = 0; S.drinks = 0; S.overSince = 0;
 }
 // Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
 // Tapping while red = false start (drink). Slowest reaction (or never reacting) drinks.
@@ -446,6 +501,12 @@ function driveBots(room, now) {
     else if (C.phase === "answer" && isBot(C.drawerId)) return act(C.drawerId, "coupleanswer", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
     else if (C.phase === "guess" && isBot(C.partnerId)) return act(C.partnerId, "coupleguess", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
   }
+  if (room.spectrum) {
+    const S = room.spectrum;
+    if (S.phase === "partner" && isBot(S.drawerId)) { const o = room.players.filter((p) => p.connected && p.id !== S.drawerId); const t = o[Math.floor(Math.random() * o.length)]; if (t) return act(S.drawerId, "spectrumpartner", { targetId: t.id }); }
+    else if (S.phase === "set" && isBot(S.setterId)) return act(S.setterId, "spectrumset", { value: Math.floor(Math.random() * 101) });
+    else if (S.phase === "guess" && isBot(S.raderId)) return act(S.raderId, "spectrumguess", { value: Math.floor(Math.random() * 101) });
+  }
 
   // ---- the bot's own turn (only while the game is still live) ----
   if (room.kings >= 4) return false;
@@ -456,7 +517,7 @@ function driveBots(room, now) {
     if (room.pendingKingShot) { const t = pickOther(cur.id); if (t) return act(cur.id, "kingshot", { name: t.name }); }
     if (room.pendingBuddy) { const t = pickOther(cur.id); if (t) return act(cur.id, "buddy", { name: t.name }); }
     if (room.pendingGive) { if (!room.givePicks || !room.givePicks.length) { const t = pickOther(cur.id); if (t) return act(cur.id, "give", { name: t.name }); } else return act(cur.id, "next"); }
-    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace || room.couple
+    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace || room.couple || room.spectrum
       || (room.juf && room.juf.phase !== "done")
       || (room.chain && room.chain.stopped.length < room.chain.order.length)
       || (room.race && now < room.race.openAt + 4000);
@@ -555,7 +616,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -571,7 +632,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -589,6 +650,7 @@ export const roomEngine = {
         if (eff === "mostlikely") startVote(room);
         if (eff === "greenlight") startGreen(room);
         if (eff === "couplequiz") startCouple(room);
+        if (eff === "spectrum") startSpectrum(room);
         if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws a RANDOM mini-game from the full pool
         if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
           room.kings += 1;
@@ -746,6 +808,39 @@ export const roomEngine = {
           C.bGuess = pick; C.match = (pick === C.aAnswer); C.phase = "over"; C.overSince = Date.now();
           if (!C.match) [C.drawerId, C.partnerId].forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; });
         }
+        return { room };
+      }
+      case "spectrumpartner": {
+        // Spectrum: the drawer picks their partner; round 1 = drawer sets, partner guesses.
+        const S = room.spectrum;
+        if (!S || S.phase !== "partner") return { room };
+        if (playerId !== S.drawerId) return { error: "Alleen wie de kaart trok" };
+        const t = room.players.find((p) => p.id === (payload && payload.targetId));
+        if (t && t.id !== S.drawerId) {
+          S.partnerId = t.id; S.partnerName = t.name;
+          S.setterId = S.drawerId; S.setterName = S.drawerName; S.raderId = t.id; S.raderName = t.name;
+          S.phase = "set";
+        }
+        return { room };
+      }
+      case "spectrumset": {
+        // Spectrum: the setter secretly places the marker (hidden until reveal).
+        const S = room.spectrum;
+        if (!S || S.phase !== "set") return { room };
+        if (playerId !== S.setterId) return { error: "Alleen de insteller" };
+        S.setVal = clampPct(payload && payload.value); S.phase = "guess";
+        return { room };
+      }
+      case "spectrumguess": {
+        // Spectrum: the rader guesses; distance = drinks for the rader.
+        const S = room.spectrum;
+        if (!S || S.phase !== "guess") return { room };
+        if (playerId !== S.raderId) return { error: "Alleen de rader" };
+        S.guessVal = clampPct(payload && payload.value);
+        S.diff = Math.abs((S.setVal || 0) - S.guessVal);
+        S.drinks = spectrumDrinks(S.diff);
+        if (S.drinks > 0) { const p = room.players.find((x) => x.id === S.raderId); if (p) p.drinks = (p.drinks || 0) + S.drinks; }
+        S.phase = "reveal"; S.overSince = Date.now();
         return { room };
       }
       case "greentap": {
@@ -909,7 +1004,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -939,7 +1034,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
@@ -1073,6 +1168,11 @@ export const roomEngine = {
       // Koppel-quiz: clear after the reveal window.
       if (room.couple && room.couple.phase === "over" && now >= room.couple.overSince + COUPLE_REVEAL_MS) {
         room.couple = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+      }
+      // Spectrum: after the reveal, swap roles for round 2, or clear after round 2.
+      if (room.spectrum && room.spectrum.phase === "reveal" && now >= room.spectrum.overSince + SPECTRUM_REVEAL_MS) {
+        if (room.spectrum.round === 1) spectrumNextRound(room); else room.spectrum = null;
+        room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
       }
       // Bus rijden: clear after the reveal; safety end if the driver goes AFK.
       if (room.bus) {
