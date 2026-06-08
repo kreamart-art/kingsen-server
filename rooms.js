@@ -88,6 +88,7 @@ function newRoom(code, hostId, opts) {
     questionMaster: null,
     pairs: [],                         // [[a,b],...]
     houseRules: [],
+    milestones: [],                    // couple's relationship milestones (oldest first) for the Tijdlijn mini-game
     pendingBuddy: false,
     spinPick: null,                    // Boer/neighbour: name the wheel landed on to DRINK (server-chosen, so every client lands the same)
     spinGiver: null,                   // Boer/neighbour: name the wheel chose to DEAL OUT (Boer B = "one deals, one drinks")
@@ -167,6 +168,8 @@ function publicState(room) {
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
     couple: room.couple ? { drawerId: room.couple.drawerId, drawerName: room.couple.drawerName, partnerId: room.couple.partnerId, partnerName: room.couple.partnerName, prompt: room.couple.prompt, phase: room.couple.phase, aAnswer: room.couple.phase === "over" ? room.couple.aAnswer : null, bGuess: room.couple.phase === "over" ? room.couple.bGuess : null, match: room.couple.match } : null,
     spectrum: room.spectrum ? { drawerId: room.spectrum.drawerId, drawerName: room.spectrum.drawerName, partnerId: room.spectrum.partnerId, partnerName: room.spectrum.partnerName, round: room.spectrum.round, setterId: room.spectrum.setterId, setterName: room.spectrum.setterName, raderId: room.spectrum.raderId, raderName: room.spectrum.raderName, prompt: room.spectrum.prompt, phase: room.spectrum.phase, setVal: room.spectrum.phase === "reveal" ? room.spectrum.setVal : null, guessVal: room.spectrum.phase === "reveal" ? room.spectrum.guessVal : null, diff: room.spectrum.diff, drinks: room.spectrum.drinks, r1: room.spectrum.r1 } : null,
+    milestones: room.milestones || [],
+    timeline: room.timeline ? { drawerId: room.timeline.drawerId, drawerName: room.timeline.drawerName, partnerId: room.timeline.partnerId, partnerName: room.timeline.partnerName, phase: room.timeline.phase, items: room.timeline.items, sips: room.timeline.sips, correctOrder: room.timeline.phase === "reveal" ? room.timeline.correctOrder : null, userOrder: room.timeline.phase === "reveal" ? room.timeline.userOrder : null } : null,
     // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
     green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
     bus: room.bus || null, // Bus rijden: all cards are revealed, nothing hidden, send as-is
@@ -217,7 +220,7 @@ function removePlayerAt(room, idx) {
   if (wasActive) {                               // their turn ended with them
     room.flipped = false; room.card = null; room.timer = null;
     room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
+    room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.pendingGive = false; room.givePicks = [];
   }
 }
 
@@ -390,6 +393,36 @@ function spectrumNextRound(room) {
   S.setterId = S.partnerId; S.setterName = S.partnerName; S.raderId = S.drawerId; S.raderName = S.drawerName;
   S.prompt = spectrumPrompt(room.lang, recentList(room, "spectrum")); S.phase = "set"; S.setVal = null; S.guessVal = null; S.diff = 0; S.drinks = 0; S.overSince = 0;
 }
+// Tijdlijn — couples timeline: drag the relationship milestones into chronological order.
+// Each event in the wrong spot = 1 sip (drawer + partner). Milestones come from the lobby
+// (room.milestones, entered oldest-first) or a fallback set. Items get OPAQUE ids so the
+// client can't derive the answer from them; the correct order is kept server-side.
+const TIMELINE_REVEAL_MS = 7000;
+const TIMELINE_FALLBACK = {
+  nl: ["Eerste keer ontmoet", "Eerste date", "Eerste kus", "Officieel een stel", "Eerste vakantie samen", "Gingen samenwonen", "Eerste huisdier", "Verloofd"],
+  en: ["First met", "First date", "First kiss", "Officially together", "First holiday together", "Moved in together", "First pet", "Got engaged"],
+};
+function shuffleArr(a) { const r = a.slice(); for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = r[i]; r[i] = r[j]; r[j] = t; } return r; }
+function timelineSource(room) {
+  const ms = Array.isArray(room.milestones) ? room.milestones.filter((s) => typeof s === "string" && s.trim()) : [];
+  if (ms.length >= 3) return ms.slice(0, 12);                 // the couple's own (already oldest-first)
+  return TIMELINE_FALLBACK[room.lang === "en" ? "en" : "nl"];
+}
+function startTimeline(room) {
+  const cur = room.players[room.turn];
+  const src = timelineSource(room);
+  const n = Math.min(5, src.length);
+  let chosen = src;
+  if (src.length > n) { const idx = shuffleArr(src.map((_, i) => i)).slice(0, n).sort((a, b) => a - b); chosen = idx.map((i) => src[i]); }
+  // chosen = labels in CORRECT chronological order. Give each an opaque id (shuffled).
+  const ids = shuffleArr(chosen.map((_, i) => i));
+  const correctOrder = chosen.map((_, k) => ids[k]);          // ids in chronological order (the secret)
+  const labelById = {}; chosen.forEach((label, k) => { labelById[ids[k]] = label; });
+  let displayIds = shuffleArr(correctOrder.slice());
+  let t = 0; while (t < 8 && displayIds.every((id, i) => id === correctOrder[i])) { displayIds = shuffleArr(correctOrder.slice()); t++; }
+  const items = displayIds.map((id) => ({ id, label: labelById[id] }));   // shuffled display order, opaque ids
+  room.timeline = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", phase: "partner", items, correctOrder, userOrder: null, sips: 0, overSince: 0 };
+}
 // Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
 // Tapping while red = false start (drink). Slowest reaction (or never reacting) drinks.
 const GREEN_MIN_MS = 2500, GREEN_MAX_MS = 7000, GREEN_TIMEOUT_MS = 6000, GREEN_REVEAL_MS = 4500, GREEN_GRACE_MS = 400;
@@ -530,6 +563,11 @@ function driveBots(room, now) {
     else if (S.phase === "set" && isBot(S.setterId)) return act(S.setterId, "spectrumset", { value: Math.floor(Math.random() * 101) });
     else if (S.phase === "guess" && isBot(S.raderId)) return act(S.raderId, "spectrumguess", { value: Math.floor(Math.random() * 101) });
   }
+  if (room.timeline) {
+    const T = room.timeline;
+    if (T.phase === "partner" && isBot(T.drawerId)) { const o = room.players.filter((p) => p.connected && p.id !== T.drawerId); const t = o[Math.floor(Math.random() * o.length)]; if (t) return act(T.drawerId, "timelinepartner", { targetId: t.id }); }
+    else if (T.phase === "sort" && isBot(T.drawerId)) return act(T.drawerId, "timelinesubmit", { order: T.items.map((it) => it.id) });
+  }
 
   // ---- the bot's own turn (only while the game is still live) ----
   if (room.kings >= 4) return false;
@@ -540,7 +578,7 @@ function driveBots(room, now) {
     if (room.pendingKingShot) { const t = pickOther(cur.id); if (t) return act(cur.id, "kingshot", { name: t.name }); }
     if (room.pendingBuddy) { const t = pickOther(cur.id); if (t) return act(cur.id, "buddy", { name: t.name }); }
     if (room.pendingGive) { if (!room.givePicks || !room.givePicks.length) { const t = pickOther(cur.id); if (t) return act(cur.id, "give", { name: t.name }); } else return act(cur.id, "next"); }
-    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace || room.couple || room.spectrum
+    const blockNext = room.bomb || room.vote || room.green || room.bus || room.thumbRace || room.couple || room.spectrum || room.timeline
       || (room.juf && room.juf.phase !== "done")
       || (room.chain && room.chain.stopped.length < room.chain.order.length)
       || (room.race && now < room.race.openAt + 4000);
@@ -640,7 +678,7 @@ export const roomEngine = {
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
         room.lastTimeout = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.pendingGive = false; room.givePicks = [];
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         armTurn(room);
         return { room };
@@ -656,7 +694,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null;   // clear any previous wheel result
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
-        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null;
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null;
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -675,6 +713,7 @@ export const roomEngine = {
         if (eff === "greenlight") startGreen(room);
         if (eff === "couplequiz") startCouple(room);
         if (eff === "spectrum") startSpectrum(room);
+        if (eff === "timeline") startTimeline(room);
         if (eff === "wildcard") startMiniGame(room); // the Joker is the ONLY card that draws a RANDOM mini-game from the full pool
         if (eff === "busrijden") {                   // Vol gas King: 1-3 = assign a shot, 4th = Ride the Bus finale
           room.kings += 1;
@@ -867,6 +906,38 @@ export const roomEngine = {
         S.phase = "reveal"; S.overSince = Date.now();
         return { room };
       }
+      case "setmilestones": {
+        // Host edits the couple's relationship milestones in the lobby (oldest first).
+        if (!isHost) return { error: "Alleen de host" };
+        const arr = Array.isArray(payload && payload.items) ? payload.items : [];
+        room.milestones = arr.map((s) => String(s == null ? "" : s).replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 40)).filter(Boolean).slice(0, 12);
+        return { room };
+      }
+      case "timelinepartner": {
+        // Tijdlijn: the drawer picks their partner; then the drawer drags the timeline.
+        const T = room.timeline;
+        if (!T || T.phase !== "partner") return { room };
+        if (playerId !== T.drawerId) return { error: "Alleen wie de kaart trok" };
+        const t = room.players.find((p) => p.id === (payload && payload.targetId));
+        if (t && t.id !== T.drawerId) { T.partnerId = t.id; T.partnerName = t.name; T.phase = "sort"; }
+        return { room };
+      }
+      case "timelinesubmit": {
+        // Tijdlijn: the drawer confirms the order; each event in the wrong spot = 1 sip (drawer + partner).
+        const T = room.timeline;
+        if (!T || T.phase !== "sort") return { room };
+        if (playerId !== T.drawerId) return { error: "Alleen wie de kaart trok" };
+        const order = Array.isArray(payload && payload.order) ? payload.order : [];
+        const ids = T.items.map((it) => it.id);
+        const valid = order.length === ids.length && new Set(order).size === order.length && order.every((id) => ids.includes(id));
+        const finalOrder = valid ? order : ids;                 // fallback to the displayed order
+        T.userOrder = finalOrder;
+        let sips = 0; for (let i = 0; i < T.correctOrder.length; i++) if (finalOrder[i] !== T.correctOrder[i]) sips++;
+        T.sips = sips;
+        [T.drawerId, T.partnerId].forEach((pid) => { if (pid) { const p = room.players.find((x) => x.id === pid); if (p) p.drinks = (p.drinks || 0) + sips; } });
+        T.phase = "reveal"; T.overSince = Date.now();
+        return { room };
+      }
       case "greentap": {
         // Wacht op groen: tap on red = false start; on green = reaction tap (last/never drinks).
         const G = room.green;
@@ -1028,7 +1099,7 @@ export const roomEngine = {
         if (!isHost) return { error: "Alleen de host kan overslaan" };
         room.flipped = false; room.card = null; room.timer = null;
         room.pendingBuddy = false; room.pendingRule = false; room.ruleEndsAt = 0;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.pendingGive = false; room.givePicks = [];
         advanceTurn(room);
         armTurn(room);
         return { room };
@@ -1058,7 +1129,7 @@ export const roomEngine = {
         room.kings = 0; room.thumbMaster = null; room.questionMaster = null;
         room.pairs = []; room.houseRules = []; room.pendingBuddy = false;
         room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null;
-        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
         room.gameStartedAt = 0; room.gameEndedAt = 0;
@@ -1200,6 +1271,11 @@ export const roomEngine = {
       // Spectrum: after the reveal, swap roles for round 2, or clear after round 2.
       if (room.spectrum && room.spectrum.phase === "reveal" && now >= room.spectrum.overSince + SPECTRUM_REVEAL_MS) {
         if (room.spectrum.round === 1) spectrumNextRound(room); else room.spectrum = null;
+        room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
+      }
+      // Tijdlijn: clear after the reveal.
+      if (room.timeline && room.timeline.phase === "reveal" && now >= room.timeline.overSince + TIMELINE_REVEAL_MS) {
+        room.timeline = null;
         room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
       }
       // Bus rijden: clear after the reveal; safety end if the driver goes AFK.
