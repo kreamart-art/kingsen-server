@@ -82,6 +82,8 @@ function newRoom(code, hostId, opts) {
     flipped: false,
     turn: 0,
     kings: 0,
+    gameStartedAt: 0,                  // server clock when the game started (shared duration on the result screen)
+    gameEndedAt: 0,                    // server clock when the game ended (kings>=4, bus cleared)
     thumbMaster: null,
     questionMaster: null,
     pairs: [],                         // [[a,b],...]
@@ -141,6 +143,8 @@ function publicState(room) {
     turn: room.turn,
     deckCount: room.deck.length,
     kings: room.kings,
+    gameStartedAt: room.gameStartedAt || 0, // shared so every player's result screen shows the same duration
+    gameEndedAt: room.gameEndedAt || 0,
     thumbMaster: room.thumbMaster,
     questionMaster: room.questionMaster,
     pairs: room.pairs,
@@ -245,18 +249,37 @@ function armTurn(room) {
    validates the answer (juf vs number); Categorie/Rijmen just need you to tap before
    the timer (the naming/rhyming itself is social). The prompt is server-picked so
    everyone sees the same category/word. */
+// Anti-repeat picker: avoid the recently-returned entries until almost the whole pool
+// has cycled, so prompts/words don't feel monotonous within an evening. `recent` is a
+// per-room history array (mutated here). Falls back to pure random if no history given.
+function pickFresh(arr, recent) {
+  if (!arr || !arr.length) return null;
+  if (!recent) return arr[Math.floor(Math.random() * arr.length)];
+  const avail = arr.filter((x) => !recent.includes(x));
+  const pool = avail.length ? avail : arr;
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  recent.push(pick);
+  const cap = Math.max(0, arr.length - 2); // keep at least 2 fresh options at all times
+  while (recent.length > cap) recent.shift();
+  return pick;
+}
+function recentList(room, key) {
+  if (!room.recentPrompts) room.recentPrompts = {};
+  if (!room.recentPrompts[key]) room.recentPrompts[key] = [];
+  return room.recentPrompts[key];
+}
 const RELAY_CATEGORIES = {
-  nl: ["Automerken", "Landen", "Dieren", "Voetbalclubs", "Cocktails", "Films", "Steden", "Beroepen", "Pizza-toppings", "Superhelden", "Fruit", "Biermerken", "Disney-films", "Lichaamsdelen", "Kleuren"],
-  en: ["Car brands", "Countries", "Animals", "Football clubs", "Cocktails", "Movies", "Cities", "Jobs", "Pizza toppings", "Superheroes", "Fruits", "Beer brands", "Disney movies", "Body parts", "Colours"],
+  nl: ["Automerken", "Landen", "Dieren", "Voetbalclubs", "Cocktails", "Films", "Steden", "Beroepen", "Pizza-toppings", "Superhelden", "Fruit", "Biermerken", "Disney-films", "Lichaamsdelen", "Kleuren", "Groenten", "Tv-series", "Zangers en zangeressen", "Rivieren", "Bloemen", "Vogels", "Sporten", "Talen", "Kledingmerken", "Frisdranken", "Snoepmerken", "Hondenrassen", "Vakantielanden", "Muziekinstrumenten", "Bekende Nederlanders", "Kruiden en specerijen", "IJssmaken", "Koffievarianten", "Gereedschap", "Insecten", "Planeten", "Boomsoorten", "Kaassoorten", "Dansstijlen", "Hoofdsteden", "Wintersporten", "Bordspellen", "Tekenfilmfiguren", "Soorten brood", "Pretparken"],
+  en: ["Car brands", "Countries", "Animals", "Football clubs", "Cocktails", "Movies", "Cities", "Jobs", "Pizza toppings", "Superheroes", "Fruits", "Beer brands", "Disney movies", "Body parts", "Colours", "Vegetables", "TV series", "Singers", "Rivers", "Flowers", "Birds", "Sports", "Languages", "Clothing brands", "Soft drinks", "Candy brands", "Dog breeds", "Holiday countries", "Musical instruments", "Famous actors", "Herbs and spices", "Ice cream flavours", "Coffee drinks", "Tools", "Insects", "Planets", "Tree species", "Cheeses", "Dance styles", "Capital cities", "Winter sports", "Board games", "Cartoon characters", "Types of bread", "Theme parks"],
 };
 const RELAY_RHYMES = {
-  nl: ["kat", "huis", "boom", "bier", "feest", "maan", "trein", "hand", "licht", "stoel", "zon", "kaas", "muur", "fiets", "hond"],
-  en: ["cat", "house", "tree", "beer", "night", "moon", "train", "hand", "light", "chair", "sun", "wall", "bike", "game", "star"],
+  nl: ["kat", "huis", "boom", "bier", "feest", "maan", "trein", "hand", "licht", "stoel", "zon", "kaas", "muur", "fiets", "hond", "vis", "deur", "geld", "hart", "nacht", "school", "brood", "kip", "slang", "paard", "wijn", "tand", "koe", "boot", "lamp", "ring", "kers", "neus", "ster", "doos", "mes", "pen", "kus", "weg", "jas", "bal", "vuur", "ijs", "schoen", "regen"],
+  en: ["cat", "house", "tree", "beer", "night", "moon", "train", "hand", "light", "chair", "sun", "wall", "bike", "game", "star", "fish", "door", "gold", "heart", "day", "school", "bread", "cup", "snake", "horse", "wine", "tooth", "cow", "boat", "lamp", "ring", "nose", "ball", "box", "pen", "kiss", "road", "coat", "fire", "ice", "shoe", "rain", "cake", "king", "phone"],
 };
-function relayPrompt(mode, lang) {
+function relayPrompt(mode, lang, recent) {
   const L = lang === "en" ? "en" : "nl";
-  if (mode === "category") { const a = RELAY_CATEGORIES[L]; return a[Math.floor(Math.random() * a.length)]; }
-  if (mode === "rhyme") { const a = RELAY_RHYMES[L]; return a[Math.floor(Math.random() * a.length)]; }
+  if (mode === "category") return pickFresh(RELAY_CATEGORIES[L], recent);
+  if (mode === "rhyme") return pickFresh(RELAY_RHYMES[L], recent);
   return null;
 }
 function startRelay(room, mode) {
@@ -264,7 +287,7 @@ function startRelay(room, mode) {
   for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
   // judgeId = the player who DREW the mini-game card (the active turn player). They —
   // not the host — start nothing manually (auto-start) but DO decide who was wrong.
-  room.juf = { mode, judgeId: (room.players[room.turn] || {}).id || null, prompt: relayPrompt(mode, room.lang), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
+  room.juf = { mode, judgeId: (room.players[room.turn] || {}).id || null, prompt: relayPrompt(mode, room.lang, recentList(room, mode)), phase: "ready", order, count: 1, turnIndex: 0, deadline: 0, ready: {}, lastResult: null, overSince: 0, readyAt: Date.now() };
 }
 // Tijdbom (hot potato): bomb starts with the drawer; players pass it; a HIDDEN random
 // fuse decides when it blows — whoever holds it then drinks. order = connected players
@@ -282,14 +305,14 @@ function startBomb(room) {
 // Wie is het meest...? — everyone votes a player for a prompt; the most-voted drink(s).
 const VOTE_MS = 22000, VOTE_REVEAL_MS = 5000;
 const VOTE_PROMPTS = {
-  nl: ["valt als eerste in slaap vanavond", "appt een ex na drie drankjes", "trakteert de hele groep", "is morgen te laat op werk", "raakt vannacht z'n telefoon kwijt", "gaat op de tafel dansen", "lacht het hardst om een slechte grap", "gaat als laatste naar huis", "maakt de gekste foto's vanavond", "is het snelst dronken", "spreekt een vreemde aan", "is morgen alles vergeten"],
-  en: ["falls asleep first tonight", "texts an ex after three drinks", "buys the whole group a round", "is late for work tomorrow", "loses their phone tonight", "ends up dancing on the table", "laughs hardest at a bad joke", "leaves last tonight", "takes the wildest photos tonight", "gets drunk the fastest", "talks to a stranger", "forgets everything by tomorrow"],
+  nl: ["valt als eerste in slaap vanavond", "appt een ex na drie drankjes", "trakteert de hele groep", "is morgen te laat op werk", "raakt vannacht z'n telefoon kwijt", "gaat op de tafel dansen", "lacht het hardst om een slechte grap", "gaat als laatste naar huis", "maakt de gekste foto's vanavond", "is het snelst dronken", "spreekt een vreemde aan", "is morgen alles vergeten", "begint te zingen zonder reden", "belt z'n moeder dronken", "morst als eerste z'n drankje", "post iets wat-ie morgen verwijdert", "flirt met de bartender", "regelt de afterparty", "kletst de oren van je kop", "neemt de meeste selfies", "eet in z'n eentje een hele pizza", "daagt iemand uit tot een shotje", "vertelt hetzelfde verhaal twee keer", "is de eerste op de dansvloer", "drinkt het traagst", "wint elk drankspel", "geeft de meeste rondjes", "stuurt een dronken spraakbericht", "kent alle songteksten mee", "raakt vanavond z'n jas kwijt", "doet de gekste dans", "zegt 'dit is m'n laatste' en blijft tot 4 uur", "valt over z'n eigen voeten", "huilt om een reclame", "wordt morgen wakker met de meeste spijt", "begint over politiek", "deelt het meest op social media", "vergeet z'n pincode", "slaapt vannacht op de bank", "maakt de meeste foto's van eten"],
+  en: ["falls asleep first tonight", "texts an ex after three drinks", "buys the whole group a round", "is late for work tomorrow", "loses their phone tonight", "ends up dancing on the table", "laughs hardest at a bad joke", "leaves last tonight", "takes the wildest photos tonight", "gets drunk the fastest", "talks to a stranger", "forgets everything by tomorrow", "starts singing for no reason", "drunk-calls their mum", "spills their drink first", "posts something they'll delete tomorrow", "flirts with the bartender", "organises the afterparty", "talks your ear off", "takes the most selfies", "eats a whole pizza alone", "dares someone to do a shot", "tells the same story twice", "is first on the dance floor", "drinks the slowest", "wins every drinking game", "buys the most rounds", "sends a drunk voice message", "knows all the lyrics", "loses their coat tonight", "does the silliest dance", "says 'this is my last one' and stays till 4am", "trips over their own feet", "cries at a commercial", "wakes up with the most regret", "starts talking politics", "shares the most on social media", "forgets their PIN", "sleeps on the couch tonight", "takes the most photos of food"],
 };
-function votePrompt(lang) { const a = VOTE_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function votePrompt(lang, recent) { return pickFresh(VOTE_PROMPTS[lang === "en" ? "en" : "nl"], recent); }
 function startVote(room) {
   const n = room.players.length, order = [];
   for (let s = 0; s < n; s++) { const p = room.players[(room.turn + s) % n]; if (p && p.connected) order.push(p.id); }
-  room.vote = { prompt: votePrompt(room.lang), order, votes: {}, phase: "voting", result: null, overSince: 0, startedAt: Date.now(), deadline: Date.now() + VOTE_MS };
+  room.vote = { prompt: votePrompt(room.lang, recentList(room, "vote")), order, votes: {}, phase: "voting", result: null, overSince: 0, startedAt: Date.now(), deadline: Date.now() + VOTE_MS };
 }
 function tallyVote(room) {
   const V = room.vote; if (!V) return;
@@ -305,13 +328,13 @@ function tallyVote(room) {
 // "who of you [prompt]?", the partner guesses that answer; a mismatch = both drink.
 const COUPLE_REVEAL_MS = 6000;
 const COUPLE_PROMPTS = {
-  nl: ["is romantischer", "is vaker jaloers", "geeft meer geld uit", "is vaker te laat", "kan beter koken", "is de baas in de relatie", "appt als eerste terug", "pakt vaker de afstandsbediening", "is sneller boos", "onthoudt verjaardagen beter", "flirt meer", "snurkt het hardst", "wint vaker een ruzie"],
-  en: ["is more romantic", "gets jealous more", "spends more money", "is late more often", "is the better cook", "wears the pants", "texts back first", "hogs the remote", "gets angry faster", "remembers birthdays better", "flirts more", "snores loudest", "wins more arguments"],
+  nl: ["is romantischer", "is vaker jaloers", "geeft meer geld uit", "is vaker te laat", "kan beter koken", "is de baas in de relatie", "appt als eerste terug", "pakt vaker de afstandsbediening", "is sneller boos", "onthoudt verjaardagen beter", "flirt meer", "snurkt het hardst", "wint vaker een ruzie", "is vaker aan het woord", "plant de vakanties", "is slechter in autorijden", "neemt vaker de laatste hap", "kiest meestal de film", "ligt langer in bed", "is vaker z'n sleutels kwijt", "geeft de beste cadeaus", "is romantischer op vakantie", "doet meer in het huishouden", "is jaloerser op social media", "zegt vaker sorry", "eet meer snoep", "is beter met geld", "kletst meer met vreemden", "danst beter", "is een grotere aansteller bij ziekte", "stuurt meer memes", "is vaker chagrijnig in de ochtend"],
+  en: ["is more romantic", "gets jealous more", "spends more money", "is late more often", "is the better cook", "wears the pants", "texts back first", "hogs the remote", "gets angry faster", "remembers birthdays better", "flirts more", "snores loudest", "wins more arguments", "talks more", "plans the holidays", "is the worse driver", "takes the last bite more often", "usually picks the movie", "stays in bed longer", "loses their keys more often", "gives the best gifts", "is more romantic on holiday", "does more housework", "is more jealous on social media", "says sorry more often", "eats more sweets", "is better with money", "chats more with strangers", "dances better", "is more dramatic when sick", "sends more memes", "is grumpier in the morning"],
 };
-function couplePrompt(lang) { const a = COUPLE_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function couplePrompt(lang, recent) { return pickFresh(COUPLE_PROMPTS[lang === "en" ? "en" : "nl"], recent); }
 function startCouple(room) {
   const cur = room.players[room.turn];
-  room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang), phase: "partner", aAnswer: null, bGuess: null, match: false, overSince: 0 };
+  room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang, recentList(room, "couple")), phase: "partner", aAnswer: null, bGuess: null, match: false, overSince: 0 };
 }
 // Spectrum — couples scale game. The setter secretly places a marker on a 0-100
 // concept; the rader guesses; the distance = drinks for the rader. Two rounds with
@@ -353,19 +376,19 @@ const SPECTRUM_PROMPTS = {
     { q: "How stubborn are you?", lo: "Easygoing", hi: "Mule" },
   ],
 };
-function spectrumPrompt(lang) { const a = SPECTRUM_PROMPTS[lang === "en" ? "en" : "nl"]; return a[Math.floor(Math.random() * a.length)]; }
+function spectrumPrompt(lang, recent) { return pickFresh(SPECTRUM_PROMPTS[lang === "en" ? "en" : "nl"], recent); }
 function spectrumDrinks(diff) { return diff <= 5 ? 0 : diff <= 15 ? 1 : diff <= 30 ? 2 : diff <= 50 ? 3 : 4; }
 function clampPct(v) { return Math.max(0, Math.min(100, Math.round(Number(v) || 0))); }
 function startSpectrum(room) {
   const cur = room.players[room.turn];
-  room.spectrum = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", round: 1, setterId: null, setterName: "", raderId: null, raderName: "", prompt: spectrumPrompt(room.lang), phase: "partner", setVal: null, guessVal: null, diff: 0, drinks: 0, r1: null, overSince: 0 };
+  room.spectrum = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", round: 1, setterId: null, setterName: "", raderId: null, raderName: "", prompt: spectrumPrompt(room.lang, recentList(room, "spectrum")), phase: "partner", setVal: null, guessVal: null, diff: 0, drinks: 0, r1: null, overSince: 0 };
 }
 function spectrumNextRound(room) {
   const S = room.spectrum; if (!S) return;
   S.r1 = { prompt: S.prompt, setVal: S.setVal, guessVal: S.guessVal, diff: S.diff, drinks: S.drinks, setterName: S.setterName, raderName: S.raderName };
   S.round = 2;
   S.setterId = S.partnerId; S.setterName = S.partnerName; S.raderId = S.drawerId; S.raderName = S.drawerName;
-  S.prompt = spectrumPrompt(room.lang); S.phase = "set"; S.setVal = null; S.guessVal = null; S.diff = 0; S.drinks = 0; S.overSince = 0;
+  S.prompt = spectrumPrompt(room.lang, recentList(room, "spectrum")); S.phase = "set"; S.setVal = null; S.guessVal = null; S.diff = 0; S.drinks = 0; S.overSince = 0;
 }
 // Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
 // Tapping while red = false start (drink). Slowest reaction (or never reacting) drinks.
@@ -611,6 +634,7 @@ export const roomEngine = {
         if (room.players.some((p) => p.connected && p.id !== room.hostId && !p.bot && !room.gateReady[p.id])) return { error: "Nog niet iedereen is klaar" };
         room.gate = false; room.gateReady = {};
         room.started = true; room.deck = makeDeck(room.jokers); room.turn = 0;
+        room.gameStartedAt = Date.now(); room.gameEndedAt = 0; // shared game clock for the result-screen duration
         room.card = null; room.flipped = false; room.kings = 0;
         room.thumbMaster = null; room.questionMaster = null; room.pairs = [];
         room.houseRules = []; room.pendingBuddy = false; room.loser = null;
@@ -1037,6 +1061,7 @@ export const roomEngine = {
         room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.pendingGive = false; room.givePicks = [];
         room.loser = null; room.turn = 0;
         room.turnEndsAt = 0; room.lastTimeout = null;
+        room.gameStartedAt = 0; room.gameEndedAt = 0;
         room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
         return { room };
       }
@@ -1080,6 +1105,9 @@ export const roomEngine = {
     tickCount++;
     const rebroadcast = tickCount % REBROADCAST_EVERY === 0;
     for (const [, room] of rooms) {
+      // Freeze the shared game clock the moment the game is truly over (4th king,
+      // and the bus finale — if any — has cleared). Within ~1s; fine for a minutes display.
+      if (room.started && room.kings >= 4 && !room.bus && !room.gameEndedAt) room.gameEndedAt = now;
       if (room.hostAwaySince && !room.closed && now - room.hostAwaySince >= (room.hostGraceMs || HOST_GRACE_MS)) {
         room.closed = true;
         room.hostAwaySince = 0;
