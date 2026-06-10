@@ -168,11 +168,11 @@ function publicState(room) {
     premium: !!room.premium, // whether this room has the premium mini-game pool (host-pays)
     // Wie is het meest: hide individual choices while voting (just who voted); reveal the winner(s) on "over".
     vote: room.vote ? { prompt: room.vote.prompt, order: room.vote.order, votedIds: Object.keys(room.vote.votes), phase: room.vote.phase, result: room.vote.result } : null,
-    couple: room.couple ? { drawerId: room.couple.drawerId, drawerName: room.couple.drawerName, partnerId: room.couple.partnerId, partnerName: room.couple.partnerName, prompt: room.couple.prompt, phase: room.couple.phase, aAnswer: room.couple.phase === "over" ? room.couple.aAnswer : null, bGuess: room.couple.phase === "over" ? room.couple.bGuess : null, match: room.couple.match } : null,
+    couple: room.couple ? { drawerId: room.couple.drawerId, drawerName: room.couple.drawerName, partnerId: room.couple.partnerId, partnerName: room.couple.partnerName, prompt: room.couple.prompt, phase: room.couple.phase, guessers: room.couple.guessers || [], guessedIds: Object.keys(room.couple.guesses || {}), aAnswer: room.couple.phase === "over" ? room.couple.aAnswer : null, guesses: room.couple.phase === "over" ? room.couple.guesses : null } : null,
     spectrum: room.spectrum ? { drawerId: room.spectrum.drawerId, drawerName: room.spectrum.drawerName, partnerId: room.spectrum.partnerId, partnerName: room.spectrum.partnerName, round: room.spectrum.round, setterId: room.spectrum.setterId, setterName: room.spectrum.setterName, raderId: room.spectrum.raderId, raderName: room.spectrum.raderName, prompt: room.spectrum.prompt, phase: room.spectrum.phase, setVal: room.spectrum.phase === "reveal" ? room.spectrum.setVal : null, guessVal: room.spectrum.phase === "reveal" ? room.spectrum.guessVal : null, diff: room.spectrum.diff, drinks: room.spectrum.drinks, r1: room.spectrum.r1 } : null,
     milestones: room.milestones || [],
     timeline: room.timeline ? { drawerId: room.timeline.drawerId, drawerName: room.timeline.drawerName, partnerId: room.timeline.partnerId, partnerName: room.timeline.partnerName, phase: room.timeline.phase, items: room.timeline.items, sips: room.timeline.sips, correctOrder: room.timeline.phase === "reveal" ? room.timeline.correctOrder : null, userOrder: room.timeline.phase === "reveal" ? room.timeline.userOrder : null } : null,
-    recall: room.recall ? { drawerId: room.recall.drawerId, drawerName: room.recall.drawerName, phase: room.recall.phase, kind: room.recall.kind, qLabel: room.recall.qLabel, lo: room.recall.lo, hi: room.recall.hi, optA: room.recall.optA, optB: room.recall.optB, differ: room.recall.differ, drinks: room.recall.drinks, oldValue: room.recall.phase === "reveal" ? room.recall.oldValue : null, oldLabel: room.recall.phase === "reveal" ? room.recall.oldLabel : null, newValue: room.recall.phase === "reveal" ? room.recall.newValue : null, newLabel: room.recall.phase === "reveal" ? room.recall.newLabel : null } : null,
+    recall: room.recall ? { mode: room.recall.mode, drawerId: room.recall.drawerId, drawerName: room.recall.drawerName, phase: room.recall.phase, kind: room.recall.kind, qLabel: room.recall.qLabel, lo: room.recall.lo, hi: room.recall.hi, optA: room.recall.optA, optB: room.recall.optB, differ: room.recall.differ, drinks: room.recall.drinks, oldValue: room.recall.phase === "reveal" ? room.recall.oldValue : null, oldLabel: room.recall.phase === "reveal" ? room.recall.oldLabel : null, newValue: room.recall.phase === "reveal" ? room.recall.newValue : null, newLabel: room.recall.phase === "reveal" ? room.recall.newLabel : null } : null,
     // Wacht op groen: send greenAt so clients flip red->green snappily (no poll lag); taps as ids.
     green: room.green ? { order: room.green.order, phase: room.green.phase, greenAt: room.green.greenAt, taps: room.green.taps.map((t) => t.id), falseStarts: room.green.falseStarts, result: room.green.result } : null,
     bus: room.bus || null, // Bus rijden: all cards are revealed, nothing hidden, send as-is
@@ -340,7 +340,20 @@ const COUPLE_PROMPTS = {
 function couplePrompt(lang, recent) { return pickFresh(COUPLE_PROMPTS[lang === "en" ? "en" : "nl"], recent); }
 function startCouple(room) {
   const cur = room.players[room.turn];
-  room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang, recentList(room, "couple")), phase: "partner", aAnswer: null, bGuess: null, match: false, overSince: 0 };
+  room.couple = { drawerId: cur ? cur.id : null, drawerName: cur ? cur.name : "", partnerId: null, partnerName: "", prompt: couplePrompt(room.lang, recentList(room, "couple")), phase: "partner", aAnswer: null, guessers: [], guesses: {}, overSince: 0 };
+}
+// Koppel-quiz reveal: every NON-couple connected player guesses the couple's answer;
+// each wrong guess = a sip. Resolve once all connected guessers have guessed.
+function coupleGuessers(room, C) {
+  const others = room.players.filter((p) => p.connected && p.id !== C.drawerId && p.id !== C.partnerId).map((p) => p.id);
+  return others.length ? others : (C.partnerId ? [C.partnerId] : []); // 2-player fallback: the partner guesses
+}
+function maybeResolveCouple(room) {
+  const C = room.couple; if (!C || C.phase !== "guess") return;
+  const pending = C.guessers.filter((id) => { const p = room.players.find((x) => x.id === id); return p && p.connected && C.guesses[id] == null; });
+  if (pending.length > 0) return;
+  for (const g of C.guessers) { if (C.guesses[g] != null && C.guesses[g] !== C.aAnswer) { const p = room.players.find((x) => x.id === g); if (p) p.drinks = (p.drinks || 0) + 1; } }
+  C.phase = "over"; C.overSince = Date.now();
 }
 // Spectrum — couples scale game. The setter secretly places a marker on a 0-100
 // concept; the rader guesses; the distance = drinks for the rader. Two rounds with
@@ -473,16 +486,28 @@ function recordAnswer(room, ans) {
 function startRecall(room) {
   const cur = room.players[room.turn];
   const drawerId = cur ? cur.id : null;
+  const drawerName = cur ? cur.name : "";
   const mine = (room.answers || []).filter((a) => a.playerId === drawerId);
-  if (!drawerId || mine.length === 0) {
-    room.recall = { drawerId, drawerName: cur ? cur.name : "", phase: "empty", overSince: Date.now() };
+  if (mine.length > 0) {
+    // CALLBACK mode: re-ask one of the drawer's stored answers.
+    const pick = mine[Math.floor(Math.random() * mine.length)];
+    room.recall = {
+      mode: "callback", drawerId, drawerName, phase: "ask", kind: pick.kind, qid: pick.qid, qLabel: pick.qLabel,
+      lo: pick.lo || "", hi: pick.hi || "", optA: pick.optA || null, optB: pick.optB || null,
+      oldValue: pick.value, oldLabel: pick.valueLabel, newValue: null, newLabel: null, differ: false, drinks: 0, overSince: 0,
+    };
     return;
   }
-  const pick = mine[Math.floor(Math.random() * mine.length)];
+  // SEED mode: nothing to recall yet — ASK a fresh scale question (not yet asked this
+  // session) and store it, so the store gets bootstrapped and it comes back later.
+  const list = SPECTRUM_PROMPTS[room.lang === "en" ? "en" : "nl"];
+  const used = new Set((room.answers || []).map((a) => a.qid));
+  const fresh = list.filter((p) => !used.has("spec:" + p.q));
+  const pool = fresh.length ? fresh : list;
+  const p = pool[Math.floor(Math.random() * pool.length)];
   room.recall = {
-    drawerId, drawerName: cur ? cur.name : "", phase: "ask", kind: pick.kind, qid: pick.qid, qLabel: pick.qLabel,
-    lo: pick.lo || "", hi: pick.hi || "", optA: pick.optA || null, optB: pick.optB || null,
-    oldValue: pick.value, oldLabel: pick.valueLabel, newValue: null, newLabel: null, differ: false, drinks: 0, overSince: 0,
+    mode: "seed", drawerId, drawerName, phase: "ask", kind: "scale", qid: "spec:" + p.q, qLabel: p.q,
+    lo: p.lo, hi: p.hi, optA: null, optB: null, oldValue: null, oldLabel: null, newValue: null, newLabel: null, differ: false, drinks: 0, overSince: 0,
   };
 }
 // Wacht op groen — screen is RED, turns GREEN at a HIDDEN-ish random moment; tap fast.
@@ -617,7 +642,7 @@ function driveBots(room, now) {
     const C = room.couple;
     if (C.phase === "partner" && isBot(C.drawerId)) { const o = room.players.filter((p) => p.connected && p.id !== C.drawerId); const t = o[Math.floor(Math.random() * o.length)]; if (t) return act(C.drawerId, "couplepartner", { targetId: t.id }); }
     else if (C.phase === "answer" && isBot(C.drawerId)) return act(C.drawerId, "coupleanswer", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
-    else if (C.phase === "guess" && isBot(C.partnerId)) return act(C.partnerId, "coupleguess", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId });
+    else if (C.phase === "guess") { const g = (C.guessers || []).find((id) => isBot(id) && C.guesses[id] == null); if (g) return act(g, "coupleguess", { pick: Math.random() < 0.5 ? C.drawerId : C.partnerId }); }
   }
   if (room.spectrum) {
     const S = room.spectrum;
@@ -920,7 +945,7 @@ export const roomEngine = {
         if (!C || C.phase !== "partner") return { room };
         if (playerId !== C.drawerId) return { error: "Alleen wie de kaart trok" };
         const t = room.players.find((p) => p.id === (payload && payload.targetId));
-        if (t && t.id !== C.drawerId) { C.partnerId = t.id; C.partnerName = t.name; C.phase = "answer"; }
+        if (t && t.id !== C.drawerId) { C.partnerId = t.id; C.partnerName = t.name; C.guessers = coupleGuessers(room, C); C.phase = "answer"; }
         return { room };
       }
       case "coupleanswer": {
@@ -936,15 +961,13 @@ export const roomEngine = {
         return { room };
       }
       case "coupleguess": {
-        // Koppel-quiz: the partner guesses the drawer's answer; mismatch = both drink.
+        // Koppel-quiz: every non-couple player guesses the drawer's answer; wrong = a sip.
         const C = room.couple;
         if (!C || C.phase !== "guess") return { room };
-        if (playerId !== C.partnerId) return { error: "Alleen de partner raadt" };
+        if (!C.guessers.includes(playerId)) return { error: "Jij hoort bij dit koppel" };
+        if (C.guesses[playerId] != null) return { room };          // already guessed
         const pick = payload && payload.pick;
-        if (pick === C.drawerId || pick === C.partnerId) {
-          C.bGuess = pick; C.match = (pick === C.aAnswer); C.phase = "over"; C.overSince = Date.now();
-          if (!C.match) [C.drawerId, C.partnerId].forEach((id) => { const p = room.players.find((x) => x.id === id); if (p) p.drinks = (p.drinks || 0) + 1; });
-        }
+        if (pick === C.drawerId || pick === C.partnerId) { C.guesses[playerId] = pick; maybeResolveCouple(room); }
         return { room };
       }
       case "spectrumpartner": {
@@ -1014,10 +1037,17 @@ export const roomEngine = {
         return { room };
       }
       case "recallanswer": {
-        // Geheugen-callback: the drawer re-answers; if it differs from the stored answer they drink.
+        // Geheugen-callback: the drawer (re-)answers. Callback mode = compare vs the stored
+        // answer (differ -> drink). Seed mode = just store a fresh answer for a later callback.
         const R = room.recall;
         if (!R || R.phase !== "ask") return { room };
         if (playerId !== R.drawerId) return { error: "Alleen wie de kaart trok" };
+        if (R.mode === "seed") {
+          R.newValue = clampPct(payload && payload.value); R.newLabel = String(R.newValue); R.differ = false; R.drinks = 0;
+          recordAnswer(room, { playerId: R.drawerId, playerName: R.drawerName, qid: R.qid, qLabel: R.qLabel, kind: "scale", value: R.newValue, valueLabel: R.newLabel, lo: R.lo, hi: R.hi });
+          R.phase = "reveal"; R.overSince = Date.now();
+          return { room };
+        }
         if (R.kind === "scale") {
           R.newValue = clampPct(payload && payload.value);
           R.newLabel = String(R.newValue);
@@ -1368,7 +1398,8 @@ export const roomEngine = {
         else if (G.phase === "green" && now >= G.greenAt + GREEN_TIMEOUT_MS) { endGreen(room); room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
         else if (G.phase === "over" && now >= G.overSince + GREEN_REVEAL_MS) { room.green = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); }
       }
-      // Koppel-quiz: clear after the reveal window.
+      // Koppel-quiz: resolve if a guesser dropped (so it never hangs), then clear after the reveal.
+      if (room.couple && room.couple.phase === "guess") { const before = room.couple.phase; maybeResolveCouple(room); if (room.couple.phase !== before) { room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room); } }
       if (room.couple && room.couple.phase === "over" && now >= room.couple.overSince + COUPLE_REVEAL_MS) {
         room.couple = null; room.rev = (room.rev || 0) + 1; if (!changed.includes(room)) changed.push(room);
       }
