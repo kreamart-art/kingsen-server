@@ -91,6 +91,7 @@ function newRoom(code, hostId, opts) {
     milestones: [],                    // couple's relationship milestones (oldest first) for the Tijdlijn mini-game
     answers: [],                       // shared answer-store {playerId,qid,...} — written by Spectrum/Koppel-quiz, read by Geheugen-callback
     recall: null,                      // Geheugen-callback state
+    venue: { enabled: false, name: "", logo: "", houseShot: { name: "", price: 0 }, promoDrink: { name: "", price: 0 }, houseRule: "", happyHour: false }, // Venue mode: per-room café branding + order moments
     pendingBuddy: false,
     spinPick: null,                    // Boer/neighbour: name the wheel landed on to DRINK (server-chosen, so every client lands the same)
     spinGiver: null,                   // Boer/neighbour: name the wheel chose to DEAL OUT (Boer B = "one deals, one drinks")
@@ -146,6 +147,7 @@ function publicState(room) {
     turn: room.turn,
     deckCount: room.deck.length,
     kings: room.kings,
+    venue: room.venue || null,          // Venue mode config (café branding + order moments)
     gameStartedAt: room.gameStartedAt || 0, // shared so every player's result screen shows the same duration
     gameEndedAt: room.gameEndedAt || 0,
     thumbMaster: room.thumbMaster,
@@ -778,11 +780,64 @@ export const roomEngine = {
         armTurn(room);
         return { room };
       }
+      case "setvenue": {
+        // Venue mode config (host): café branding + drinks for the order moments.
+        if (!isHost) return { error: "Alleen de host" };
+        const v = (payload && payload.venue) || {};
+        const cl = (s, n) => cleanText(s == null ? "" : s).slice(0, n);
+        const money = (n) => { const x = Math.round((Number(n) || 0) * 100) / 100; return Math.max(0, Math.min(9999, x)); };
+        const drink = (d) => ({ name: cl(d && d.name, 40), price: money(d && d.price) });
+        room.venue = { enabled: !!v.enabled, name: cl(v.name, 40), logo: cl(v.logo, 8), houseShot: drink(v.houseShot), promoDrink: drink(v.promoDrink), houseRule: cl(v.houseRule, 120), happyHour: !!v.happyHour };
+        return { room };
+      }
+      case "teststart": {
+        // Admin Testmodus: open a dummy pot (add a bot if needed, skip the gate) to preview venue cards.
+        if (!isHost) return { error: "Alleen de host" };
+        if (room.started) return { room };
+        if (room.players.filter((p) => p.connected).length < 2) {
+          const id = "bot_" + Math.random().toString(36).slice(2, 9);
+          room.players.push({ id, name: "Testbot", avatar: "", connected: true, cards: 0, threes: 0, drinks: 0, bot: true });
+        }
+        room.gate = false; room.gateReady = {};
+        room.started = true; room.deck = makeDeck(room.jokers); room.turn = 0;
+        room.gameStartedAt = Date.now(); room.gameEndedAt = 0;
+        room.card = null; room.flipped = false; room.kings = 0;
+        room.thumbMaster = null; room.questionMaster = null; room.pairs = [];
+        room.houseRules = []; room.pendingBuddy = false; room.loser = null;
+        room.pendingRule = false; room.ruleEndsAt = 0; room.timer = null; room.lastTimeout = null;
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.race = null; room.chain = null; room.juf = null; room.thumbRace = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.recall = null; room.answers = []; room.pendingGive = false; room.givePicks = [];
+        room.players.forEach((p) => { p.cards = 0; p.threes = 0; p.drinks = 0; });
+        armTurn(room);
+        return { room };
+      }
+      case "forcedraw": {
+        // Admin Testmodus: force a specific card so the admin can preview each venue moment.
+        if (!isHost) return { error: "Alleen de host" };
+        if (!room.started) return { room };
+        let rank = String((payload && payload.rank) || "");
+        const king4 = rank === "king4";
+        if (king4) { rank = "K"; room.kings = 3; }
+        if (!["5", "10", "J", "K", "A", "Q"].includes(rank)) return { room };
+        const venueOn = !!(room.venue && room.venue.enabled);
+        room.spinPick = null; room.spinGiver = null; room.pendingKingShot = false; room.kingShotTarget = null; room.pendingGive = false; room.givePicks = [];
+        room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.recall = null;
+        if (rank === "K") {
+          room.kings += 1;
+          if (room.kings >= 4) { room.loser = cur.name; }
+          else if (!venueOn) { room.pendingKingShot = true; room.kingShotTarget = null; }
+        }
+        room.card = { rank, sym: "♠", color: "black" };
+        room.flipped = true;
+        armTurn(room);
+        return { room };
+      }
       case "draw": {
         if (!isTurn) return { error: "Niet jouw beurt" };
         if (room.flipped || room.deck.length === 0) return { room };
         const next = room.deck.pop();
         const eff = room.effects[next.rank];
+        const venueOn = !!(room.venue && room.venue.enabled); // venue mode: 5/10/J/K become order moments — suppress their social actions (king counter stays)
+        const venueRank = venueOn && ["5", "10", "J", "K"].includes(next.rank); // these 4 are ALWAYS order moments in venue mode, whatever the set maps them to
         cur.cards += 1;
         if (next.rank === "3") cur.threes += 1;
         if (eff === "drink") cur.drinks = (cur.drinks || 0) + 1; // self-drink -> drinks tally
@@ -790,6 +845,12 @@ export const roomEngine = {
         room.pendingKingShot = false; room.kingShotTarget = null;
         room.pendingGive = false; room.givePicks = [];
         room.race = null; room.chain = null; room.juf = null; room.bomb = null; room.vote = null; room.green = null; room.bus = null; room.couple = null; room.spectrum = null; room.timeline = null; room.recall = null;
+        if (venueRank) {
+          // Venue order moment (5/10/Boer/Koning): the card face shows the bar action,
+          // so NO social role or mini-game fires here — whatever the set mapped this rank to.
+          // King's Cup counter still runs: 1-3 fill the crowns, the 4th is the house round.
+          if (next.rank === "K") { room.kings += 1; if (room.kings >= 4) room.loser = cur.name; }
+        } else {
         if (eff === "thumbmaster") room.thumbMaster = cur.name;
         if (eff === "race") {                          // Hemel B: 3-2-1 then a tap race (last drinks)
           room.race = { kind: "heaven", openAt: Date.now() + 3000, taps: [] };
@@ -841,8 +902,9 @@ export const roomEngine = {
         if (eff === "newrule") { room.pendingRule = true; room.ruleEndsAt = Date.now() + RULE_MS; }
         if (eff === "king") {
           room.kings += 1;
-          if (room.kings >= 4) { room.loser = cur.name; cur.drinks = (cur.drinks || 0) + 1; } // 4th king drinks the glass
-          else { room.pendingKingShot = true; room.kingShotTarget = null; } // Koning B: kings 1-3 -> assign a shot
+          if (room.kings >= 4) { room.loser = cur.name; cur.drinks = (cur.drinks || 0) + 1; }
+          else { room.pendingKingShot = true; room.kingShotTarget = null; }
+        }
         }
         room.card = next; room.flipped = true;
         room.timer = null; // fresh card -> no timer yet
